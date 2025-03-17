@@ -1,0 +1,23 @@
+{
+    "files.associations": {
+        "scth.h": "c",
+        "module.h": "c",
+        "fs.h": "c",
+        "errno.h": "c",
+        "sha256_utils.h": "c",
+        "time.h": "c",
+        "version.h": "c",
+        "utils.h": "c",
+        "state.h": "c",
+        "string.h": "c",
+        "action.h": "c",
+        "stdbool.h": "c",
+        "reference_monitor_state.h": "c",
+        "constants.h": "c",
+        "intrusion_log.h": "c",
+        "sched.h": "c",
+        "mount.h": "c",
+        "singlefilefs.h": "c"
+    },
+    "C_Cpp.errorSquiggles": "disabled"
+}
