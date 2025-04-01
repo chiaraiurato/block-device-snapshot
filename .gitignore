@@ -1,0 +1,44 @@
+# Object files and intermediates
+*.o
+*.mod
+*.mod.c
+*.mod.o
+*.ko
+*.order
+*.symvers
+
+# Make command files
+.*.cmd
+
+# Build output files
+Module.symvers
+modules.order
+
+# Generated kernel files
+the_*.ko
+the_*.mod
+the_*.mod.c
+the_*.mod.o
+
+# Build system files
+.tmp_versions/
+
+# VS Code configuration
+.vscode/
+
+# Temporary image files
+image
+
+# User binaries
+user/user.out
+
+# Log files
+/tmp/bdevsnap.log
+
+# Kernel build artifacts
+*.unsigned
+*.dwo
+*.lst
+*.symtypes
+*.bin
+*.dtb
