@@ -60,7 +60,7 @@ MODULE_DESCRIPTION("block device snapshot");
 
 typedef struct _bdev_snapshot {
         spinlock_t lock;  
-        char *password_digest;     
+        struct salted_hash *password_digest;     
 } bdev_snapshot;
 
 static bdev_snapshot snapshot;
@@ -79,13 +79,93 @@ int restore[HACKED_ENTRIES] = {[0 ... (HACKED_ENTRIES-1)] -1};
 #define AUDIT if(1)
 
 #define CURRENT_EUID current->cred->euid.val
-#define HASH_LEN 32
 #define MAX_DEV_LEN 256  /* Maximum device name length */
 #define MAX_PWD_LEN 128  /* Maximum password length */
 
-unsigned char the_snaphot_secret[HASH_LEN]; 
-module_param_string(the_snapshot_secret, the_snaphot_secret, 32, 0);
+unsigned char the_snapshot_secret[HASH_LEN]; 
+module_param_string(the_snapshot_secret, the_snapshot_secret, HASH_LEN, 0);
 MODULE_PARM_DESC(the_snapshot_secret, "Password used for authentication");
+
+static int handle_snapshot_operation(const char __user *devname, 
+                                     const char __user *passwd,
+                                     bool type)
+{
+    AUDIT
+    printk("%s: sys_%s_snapshot called from thread %d\n", 
+          MODNAME, type ? "activate" : "deactivate", current->pid);
+    
+    int ret;
+    char *k_devname = NULL;
+    char *k_passwd = NULL;
+    size_t devname_len, passwd_len;
+
+    /* Common validation logic */
+    if (!devname || !passwd) {
+        pr_warn("%s: Null pointer passed\n", MODNAME);
+        return -EINVAL;
+    }
+
+    devname_len = strnlen_user(devname, MAX_DEV_LEN) + 1;
+    passwd_len = strnlen_user(passwd, MAX_PWD_LEN) + 1;
+
+    if (devname_len > MAX_DEV_LEN || passwd_len > MAX_PWD_LEN) {
+        pr_warn("%s: Input string too long\n", MODNAME);
+        return -ENAMETOOLONG;
+    }
+
+    k_devname = kmalloc(devname_len, GFP_KERNEL);
+    k_passwd = kmalloc(passwd_len, GFP_KERNEL);
+    if (!k_devname || !k_passwd) {
+        ret = -ENOMEM;
+        pr_err("%s: Memory allocation failed\n", MODNAME);
+        goto cleanup;
+    }
+
+    if (copy_from_user(k_devname, devname, devname_len) || 
+        copy_from_user(k_passwd, passwd, passwd_len)) {
+        ret = -EFAULT;
+        pr_err("%s: Failed to copy from userspace\n", MODNAME);
+        goto cleanup;
+    }
+
+    k_devname[devname_len - 1] = '\0';
+    k_passwd[passwd_len - 1] = '\0';
+
+    spin_lock(&snapshot.lock);
+
+    /* Common auth checks */
+    if (CURRENT_EUID != 0) {
+        ret = -EPERM;
+        pr_notice("%s: Non-root access denied (PID: %d)\n",
+                MODNAME, current->pid);
+        goto unlock;
+    }
+
+    if (authenticate(k_passwd, snapshot.password_digest) != 0) {
+        ret = -EACCES;
+        pr_notice("%s: Invalid credentials for device %s\n",
+                MODNAME, k_devname);
+        goto unlock;
+    }
+
+    /* Operation-specific logic */
+    if (type) {
+        printk("%s: Snapshot activation for %s successful\n", MODNAME, k_devname);
+        // activate_device_snapshot(k_devname);
+    } else {
+        printk("%s: Snapshot deactivation for %s successful\n", MODNAME, k_devname);
+        // deactivate_device_snapshot(k_devname);
+    }
+    ret = 0;
+
+unlock:
+    spin_unlock(&snapshot.lock);
+cleanup:
+    kfree(k_devname);
+    kfree(k_passwd);
+    return ret;
+}
+
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
 __SYSCALL_DEFINEx(2, _activate_snapshot, const char  __user *, devname,const char __user *, passwd){
@@ -93,83 +173,7 @@ __SYSCALL_DEFINEx(2, _activate_snapshot, const char  __user *, devname,const cha
 asmlinkage long sys_activate_snapshot(const char  __user *devname, const char __user *passwd){
 #endif
 
-        AUDIT
-        printk("%s: sys_active_snapshot called from thread %d\n",MODNAME,current->pid);
-        int ret;
-        char *k_devname = NULL;
-        char *k_passwd = NULL;
-        size_t devname_len, passwd_len;
-
-        /* Basic sanity check */
-        if (!devname || !passwd) {
-                pr_warn("%s: Null pointer passed\n", MODNAME);
-                return -EINVAL;
-        }
-
-        /* Calculate string lengths safely */
-        devname_len = strnlen_user(devname, MAX_DEV_LEN) + 1;
-        passwd_len = strnlen_user(passwd, MAX_PWD_LEN) + 1;
-
-        /* Check length validity */
-        if (devname_len > MAX_DEV_LEN || passwd_len > MAX_PWD_LEN) {
-                pr_warn("%s: Input string too long\n", MODNAME);
-                return -ENAMETOOLONG;
-        }
-
-        /* Allocate kernel buffers */
-        k_devname = kmalloc(devname_len, GFP_KERNEL);
-        k_passwd = kmalloc(passwd_len, GFP_KERNEL);
-        if (!k_devname || !k_passwd) {
-                ret = -ENOMEM;
-                pr_err("%s: Memory allocation failed\n", MODNAME);
-                goto cleanup;
-        }
-
-
-        /* Copy data from userspace */
-        if (copy_from_user(k_devname, devname, devname_len) || 
-                copy_from_user(k_passwd, passwd, passwd_len)) {
-                ret = -EFAULT;
-                pr_err("%s: Failed to copy from userspace\n", MODNAME);
-                goto cleanup;
-        }
-
-        /* Ensure null termination */
-        k_devname[devname_len - 1] = '\0';
-        k_passwd[passwd_len - 1] = '\0';
-
-       /* Authorization check */
-        if (CURRENT_EUID != 0) {
-                ret = -EPERM;
-                pr_notice("%s: Non-root access denied (PID: %d)\n",
-                        MODNAME, current->pid);
-                goto unlock;
-        }
-
-        /* Authentication check */
-        if (authenticate(k_passwd, snapshot.password_digest) != 0) {
-                ret = -EACCES;
-                pr_notice("%s: Invalid credentials for device %s\n",
-                        MODNAME, k_devname);
-                goto unlock;
-        }
-
-        // /* Main operation */
-        // ret = activate_device_snapshot(k_devname);
-        // if (ret < 0) {
-        //         pr_err("%s: Snapshot activation failed for %s (err: %d)\n",
-        //         MODNAME, k_devname, ret);
-        // } else {
-        //         pr_info("%s: Snapshot activated for %s\n",
-        //         MODNAME, k_devname);
-        // }
-        printk("%s: Snapshot activation for %s successful\n", MODNAME, k_devname);
-unlock:
-        spin_unlock(&snapshot.lock);
-cleanup:
-        kfree(k_devname);
-        kfree(k_passwd);
-        return ret;
+        return handle_snapshot_operation(devname, passwd, true);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
@@ -177,20 +181,7 @@ __SYSCALL_DEFINEx(2, _deactivate_snapshot, const char  __user *, devname,const c
 #else
 asmlinkage long sys_deactivate_snapshot(const char  __user *devname, const char __user *passwd){
 #endif
-	AUDIT
-        printk("%s: sys_deactivate_snapshot called from thread %d\n",MODNAME,current->pid);
-
-        spin_lock(&snapshot.lock);
-        
-        if(CURRENT_EUID != 0 ){
-                printk("%s: %s\n",MODNAME, "Permission denied");
-        // }else if (authenticate(passwd, snapshot.password_digest) != 0)
-        // {
-        //         printk("%s: %s\n",MODNAME, "Authentication failed");
-        }
-        printk("%s: %s\n",MODNAME, "Deactivating snapshot successfully");
-        spin_unlock(&snapshot.lock);
-        return 0;
+        return handle_snapshot_operation(devname, passwd, false);
 
 }
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
@@ -205,22 +196,24 @@ int init_module(void) {
         int i;
         int ret;
         printk("%s: Initializing module...\n", MODNAME);
-        snapshot.password_digest = kmalloc(32, GFP_KERNEL);
+        snapshot.password_digest = kmalloc(sizeof(struct salted_hash), GFP_KERNEL);
         if(!snapshot.password_digest){
                 pr_err("%s: memory allocation failed for storing password digest\n",MODNAME);
                 return -ENOMEM;
         }
+        memset(snapshot.password_digest, 0, sizeof(struct salted_hash)); // Initialize to zero
         // Compute hash of the input password
         
-        ret = compute_hash_password(the_snaphot_secret, strlen(the_snaphot_secret), snapshot.password_digest);
+        ret = compute_salted_hash(the_snapshot_secret, strlen(the_snapshot_secret), snapshot.password_digest);
         if (ret < 0) {
-        printk("%s: Error computing password hash\n", MODNAME);
-        return -1;
+                printk("%s: Error computing password hash\n", MODNAME);
+                kfree(snapshot.password_digest);
+                snapshot.password_digest = NULL;
+                return -1;
         }
 
         printk("%s: Password hash computed successfully with return code: %d\n", MODNAME, ret);
-       
-        printk("%s: Password hash: %s ", MODNAME, snapshot.password_digest);
+
         if (the_syscall_table == 0x0){
            printk("%s: cannot manage sys_call_table address set to 0x0\n",MODNAME);
            return -1;
