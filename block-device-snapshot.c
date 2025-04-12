@@ -47,6 +47,7 @@
 #include <linux/spinlock.h>
 #include "lib/include/scth.h"
 #include "utils/include/auth.h"
+#include "register/include/register.h"
 
 
 MODULE_LICENSE("GPL");
@@ -88,11 +89,11 @@ MODULE_PARM_DESC(the_snapshot_secret, "Password used for authentication");
 
 static int handle_snapshot_operation(const char __user *devname, 
                                      const char __user *passwd,
-                                     bool type)
+                                     bool activate)
 {
     AUDIT
     printk("%s: sys_%s_snapshot called from thread %d\n", 
-          MODNAME, type ? "activate" : "deactivate", current->pid);
+          MODNAME, activate ? "activate" : "deactivate", current->pid);
     
     int ret;
     char *k_devname = NULL;
@@ -131,35 +132,34 @@ static int handle_snapshot_operation(const char __user *devname,
     k_devname[devname_len - 1] = '\0';
     k_passwd[passwd_len - 1] = '\0';
 
-    spin_lock(&snapshot.lock);
-
     /* Common auth checks */
     if (CURRENT_EUID != 0) {
         ret = -EPERM;
         pr_notice("%s: Non-root access denied (PID: %d)\n",
                 MODNAME, current->pid);
-        goto unlock;
     }
 
     if (authenticate(k_passwd, snapshot.password_digest) != 0) {
         ret = -EACCES;
         pr_notice("%s: Invalid credentials for device %s\n",
                 MODNAME, k_devname);
-        goto unlock;
     }
 
     /* Operation-specific logic */
-    if (type) {
-        printk("%s: Snapshot activation for %s successful\n", MODNAME, k_devname);
-        // activate_device_snapshot(k_devname);
+    if (activate) {
+        ret = register_device(k_devname);
+        if (ret == -EEXIST) {
+             printk("%s: Device %s already registered\n", MODNAME, k_devname);
+             ret = 0;
+         }
     } else {
-        printk("%s: Snapshot deactivation for %s successful\n", MODNAME, k_devname);
-        // deactivate_device_snapshot(k_devname);
+        ret = unregister_device(k_devname);
+        if (ret == -ENODEV) {
+            printk("%s: Device %s not found\n", MODNAME, k_devname);
+            ret = 0;
+        }
     }
-    ret = 0;
-
-unlock:
-    spin_unlock(&snapshot.lock);
+    
 cleanup:
     kfree(k_devname);
     kfree(k_passwd);
@@ -243,7 +243,14 @@ int init_module(void) {
 
         protect_memory();
 
-        printk("%s: all new system-calls correctly installed on sys-call table\n",MODNAME);
+        printk("all new system-calls correctly installed on sys-call table\n");
+
+        ret = install_mount_hook();
+        if (ret < 0) {
+            printk("%s: Error while hooking mount_bdev()\n", MODNAME);
+            return ret;
+        }
+        printk("%s: register mount_bdev() hook successfully\n", MODNAME);
 
         return 0;
 
@@ -256,6 +263,7 @@ void cleanup_module(void) {
 
         printk("%s: shutting down\n",MODNAME);
 
+        remove_mount_hook();
         unprotect_memory();
         for(i=0;i<HACKED_ENTRIES;i++){
                 ((unsigned long *)the_syscall_table)[restore[i]] = the_ni_syscall;
