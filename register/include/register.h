@@ -44,14 +44,16 @@ struct loop_device {
 
 /**
  * struct snapshot_device - Represents a snapshot device
- * @name: Name of the device
+ * @name: Device name (e.g., "/dev/loop0" or image path)
  * @snapshot_active: Flag indicating if snapshot is active
  * @list: List head for linking devices
+ * @rcu: RCU head used for lockless readers
  */
 typedef struct {
     char name[MAX_DEV_LEN];
     bool snapshot_active;
     struct list_head list;
+    struct rcu_head rcu;
 } snapshot_device;
 
 /* Device Management Functions */

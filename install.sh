@@ -4,6 +4,9 @@
 
 # Run make clean
 echo "Running make clean..."
+make clean-fs
+make unmount-fs
+make rmmod-fs
 make clean
 
 # Run make all
@@ -12,7 +15,7 @@ make all
 
 # Run make create_singlefilefs
 echo "Creating single file system..."
-make create_singlefilefs
+make create-singlefilefs
 
 # Run make run-user
 # echo "Running user..."

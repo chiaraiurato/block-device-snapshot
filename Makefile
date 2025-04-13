@@ -18,7 +18,7 @@ compile:
 	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD)/singlefile-FS modules
 	@echo "Compilation completed successfully"
 
-create_singlefilefs:
+create-singlefilefs:
 	dd bs=4096 count=100 if=/dev/zero of=image
 	./singlefilemakefs image
 	mkdir $(LOG_DIRECTORY_PATH)
@@ -39,12 +39,12 @@ mount:
 		(echo "Failed to load block-device-snapshot module"; exit 1)
 	
 	
-mount_fs:
+mount-fs:
 	sudo insmod $(SINGLEFILE_FS_DIR)/singlefilefs.ko
 	sudo mount -o loop -t singlefilefs image $(LOG_DIRECTORY_PATH)/
 	@echo "Modules mounted successfully"
 
-unmount_fs:
+unmount-fs:
 	sudo umount $(LOG_DIRECTORY_PATH)/ -f
 
 compile-user:
@@ -57,13 +57,13 @@ run-user: compile-user
 	@sudo $(USER_APP)
 	@echo "User application execution completed"
 
-clean: unmount unmount_fs clean-compile clean-fs
+clean: unmount clean-compile
 
 clean-compile:
 	@echo "Cleaning up..."
 	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD)/the_usctm clean
 	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
-	@rmdir $(LOG_DIRECTORY_PATH)
+	@rm -rf $(LOG_DIRECTORY_PATH)
 	@echo "Cleanup completed"
 	
 clean-fs:
@@ -75,7 +75,9 @@ unmount:
 	@echo "Unmounting modules..."
 	@-sudo rmmod the_block-device-snapshot 2>/dev/null && echo "block-device-snapshot module unloaded" || echo "block-device-snapshot module not loaded"
 	# @-sudo rmmod the_usctm 2>/dev/null && echo "usctm module unloaded" || echo "usctm module not loaded"
-	@-sudo rmmod ./singlefile-FS/singlefilefs.ko
 	@echo "Unmount completed"
 
+rmmod-fs:
+	@-sudo rmmod singlefilefs
+	@echo "Unmounted single file system"
 .PHONY: all compile mount clean clean-compile unmount
