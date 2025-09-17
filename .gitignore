@@ -32,8 +32,8 @@ image
 # User binaries
 user/user.out
 
-# Log files
-/tmp/bdevsnap.log
+# System files
+singlefilemakefs
 
 # Kernel build artifacts
 *.unsigned

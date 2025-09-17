@@ -152,6 +152,7 @@ static int handle_snapshot_operation(const char __user *devname,
              printk("%s: Device %s already registered\n", MODNAME, k_devname);
              ret = 0;
          }
+        
     } else {
         ret = unregister_device(k_devname);
         if (ret == -ENODEV) {

@@ -21,8 +21,8 @@ make create-singlefilefs
 # echo "Running user..."
 # make run-user
 
-# Run make mount_fs
+# Run make mount-fs
 # echo "Mounting file system..."
-# make mount_fs
+# make mount-fs
 
 echo "install.sh completed successfully."
