@@ -3,13 +3,12 @@
 
 #include <linux/list.h>
 #include <linux/spinlock.h>
+#include <linux/limits.h>
 #include <linux/fs.h>
+#include "../../snapshot/include/snapshot.h"
 
 /* Maximum number of devices supported */
 #define MAX_DEVICES 32
-
-/* Maximum length of a device name */
-#define MAX_DEV_LEN 256
 
 /* Size of loop device file name buffer */
 #define LO_NAME_SIZE 64
@@ -43,22 +42,6 @@ struct loop_device {
 };
 
 /**
- * struct snapshot_device - Represents a snapshot device
- * @name: Device name (e.g., "/dev/loop0" or image path)
- * @snapshot_active: Flag indicating if snapshot is active
- * @list: List head for linking devices
- * @rcu: RCU head used for lockless readers
- */
-typedef struct {
-    char name[MAX_DEV_LEN];
-    bool snapshot_active;
-    struct list_head list;
-    struct rcu_head rcu;
-} snapshot_device;
-
-/* Device Management Functions */
-
-/**
  * register_device - Register a new device
  * @devname: Name of the device to register
  * Return: 0 on success, error code on failure
@@ -79,6 +62,18 @@ int unregister_device(const char *devname);
  */
 snapshot_device *find_device(const char *devname);
 
+/**
+ * store_key_from_userspec - Store a key name for device from userspace input
+ * @userspec: User-provided device name (e.g., "/dev/loop0" or image path)
+ * @out: Output buffer to store the canonical key
+ * @len: Length of the output buffer
+ */
+int store_key_from_userspec(const char *userspec, char *out, size_t len);
+
+/**
+ * Create /snapshot directory if it doesn't exist
+ */
+int ensure_snapshot_root_directory(void);
 /* Kernel Probe Functions */
 
 /**

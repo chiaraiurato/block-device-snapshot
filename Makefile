@@ -1,9 +1,7 @@
 obj-m += the_block-device-snapshot.o
-the_block-device-snapshot-objs += block-device-snapshot.o lib/scth.o utils/auth.o register/register.o
+the_block-device-snapshot-objs += block-device-snapshot.o lib/scth.o utils/auth.o register/register.o snapshot/snapshot.o
 
-SYS_CALL_TABLE = $(shell sudo cat /sys/module/the_usctm/parameters/sys_call_table_address 2>/dev/null)
 LOG_DIRECTORY_PATH = /tmp/bdevsnap.log
-SECR3T = $(shell cat ./s3cr3t)
 USER_APP = user/user.out
 USER_SRC = user/user.c
 SINGLEFILE_FS_DIR = singlefile-FS
@@ -25,19 +23,42 @@ create-singlefilefs:
 
 mount:
 	@echo "Mounting modules..."
-	@if ! lsmod | grep -q the_usctm; then \
-		sudo insmod the_usctm/the_usctm.ko; \
-		echo "usctm module loaded"; \
+	@if ! lsmod | grep -q '^the_usctm'; then \
+		echo "[mount] loading the_usctm.ko"; \
+		sudo insmod the_usctm/the_usctm.ko || { echo "ERROR: failed to load the_usctm"; exit 1; }; \
 	else \
-		echo "usctm module already loaded"; \
-	fi
-	@if [ -z "$(SYS_CALL_TABLE)" ]; then \
-		echo "Error: SYS_CALL_TABLE is empty. Ensure the_usctm module is loaded correctly."; \
+		echo "[mount] the_usctm already loaded"; \
+	fi; \
+	\
+	SYSFS_FILE=/sys/module/the_usctm/parameters/sys_call_table_address; \
+	echo "[mount] waiting for $$SYSFS_FILE"; \
+	for i in $$(seq 1 100); do \
+		if [ -e "$$SYSFS_FILE" ]; then \
+			SYS_CALL_TABLE=$$(sudo cat "$$SYSFS_FILE" 2>/dev/null); \
+			[ -n "$$SYS_CALL_TABLE" ] && break; \
+		fi; \
+		sleep 0.05; \
+	done; \
+	if [ -z "$$SYS_CALL_TABLE" ]; then \
+		echo "ERROR: SYS_CALL_TABLE is empty (cannot read $$SYSFS_FILE)"; \
 		exit 1; \
-	fi
-	@sudo insmod the_block-device-snapshot.ko the_syscall_table=$(SYS_CALL_TABLE) the_snapshot_secret=$(SECR3T) || \
-		(echo "Failed to load block-device-snapshot module"; exit 1)
-	
+	fi; \
+	echo "[mount] sys_call_table=$$SYS_CALL_TABLE"; \
+	\
+	if [ ! -f ./s3cr3t ]; then \
+		echo "ERROR: ./s3cr3t not found"; \
+		exit 1; \
+	fi; \
+	SECR3T_VAL=$$(cat ./s3cr3t); \
+	if [ -z "$$SECR3T_VAL" ]; then \
+		echo "ERROR: ./s3cr3t is empty"; \
+		exit 1; \
+	fi; \
+	echo "[mount] loading the_block-device-snapshot.ko"; \
+	sudo insmod the_block-device-snapshot.ko \
+		the_syscall_table=$$SYS_CALL_TABLE \
+		the_snapshot_secret=$$SECR3T_VAL || { echo "ERROR: failed to load snapshot"; exit 1; }
+
 	
 mount-fs:
 	sudo insmod $(SINGLEFILE_FS_DIR)/singlefilefs.ko

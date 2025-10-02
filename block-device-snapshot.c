@@ -15,7 +15,7 @@
 *
 * @author Iurato Chiara
 *
-* @date March, 2025
+* @date September, 2025
 */
 
 #define EXPORT_SYMTAB
@@ -48,23 +48,16 @@
 #include "lib/include/scth.h"
 #include "utils/include/auth.h"
 #include "register/include/register.h"
+#include "snapshot/include/snapshot.h"
 
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Iurato Chiara <chiara.iurat@gmail.com>");
 MODULE_DESCRIPTION("block device snapshot");
 
-
-
 #define MODNAME "SNAPSHOT"
 
-
-typedef struct _bdev_snapshot {
-        spinlock_t lock;  
-        struct salted_hash *password_digest;     
-} bdev_snapshot;
-
-static bdev_snapshot snapshot;
+static struct salted_hash *password_digest;
 
 unsigned long the_syscall_table = 0x0;
 module_param(the_syscall_table, ulong, 0);
@@ -83,7 +76,7 @@ int restore[HACKED_ENTRIES] = {[0 ... (HACKED_ENTRIES-1)] -1};
 #define MAX_DEV_LEN 256  /* Maximum device name length */
 #define MAX_PWD_LEN 128  /* Maximum password length */
 
-unsigned char the_snapshot_secret[HASH_LEN]; 
+static char the_snapshot_secret[HASH_LEN]; 
 module_param_string(the_snapshot_secret, the_snapshot_secret, HASH_LEN, 0);
 MODULE_PARM_DESC(the_snapshot_secret, "Password used for authentication");
 
@@ -137,14 +130,21 @@ static int handle_snapshot_operation(const char __user *devname,
         ret = -EPERM;
         pr_notice("%s: Non-root access denied (PID: %d)\n",
                 MODNAME, current->pid);
+        goto cleanup;
     }
 
-    if (authenticate(k_passwd, snapshot.password_digest) != 0) {
+    if (authenticate(k_passwd, password_digest) != 0) {
         ret = -EACCES;
         pr_notice("%s: Invalid credentials for device %s\n",
                 MODNAME, k_devname);
+        goto cleanup;
     }
-
+    /* Init /snapshot dir */
+    int err = ensure_snapshot_root_directory();
+    if (err) {
+        pr_err("SNAPSHOT: Unable to check if /snapshot exists\n");
+        goto cleanup;
+    }
     /* Operation-specific logic */
     if (activate) {
         ret = register_device(k_devname);
@@ -197,19 +197,19 @@ int init_module(void) {
         int i;
         int ret;
         printk("%s: Initializing module...\n", MODNAME);
-        snapshot.password_digest = kmalloc(sizeof(struct salted_hash), GFP_KERNEL);
-        if(!snapshot.password_digest){
+        password_digest = kmalloc(sizeof(struct salted_hash), GFP_KERNEL);
+        if(!password_digest){
                 pr_err("%s: memory allocation failed for storing password digest\n",MODNAME);
                 return -ENOMEM;
         }
-        memset(snapshot.password_digest, 0, sizeof(struct salted_hash)); // Initialize to zero
+        memset(password_digest, 0, sizeof(struct salted_hash)); // Initialize to zero
         // Compute hash of the input password
         
-        ret = compute_salted_hash(the_snapshot_secret, strlen(the_snapshot_secret), snapshot.password_digest);
+        ret = compute_salted_hash(the_snapshot_secret, strlen(the_snapshot_secret), password_digest);
         if (ret < 0) {
                 printk("%s: Error computing password hash\n", MODNAME);
-                kfree(snapshot.password_digest);
-                snapshot.password_digest = NULL;
+                kfree(password_digest);
+                password_digest = NULL;
                 return -1;
         }
 
@@ -252,6 +252,9 @@ int init_module(void) {
             return ret;
         }
         printk("%s: register mount_bdev() hook successfully\n", MODNAME);
+        
+        /* create workqueue for mounting sdev*/
+        snapshot_init();
 
         return 0;
 
@@ -259,17 +262,22 @@ int init_module(void) {
 
 
 void cleanup_module(void) {
-
-        int i;
-
+        // snapshot_device *dev, *tmp;
         printk("%s: shutting down\n",MODNAME);
 
         remove_mount_hook();
         unprotect_memory();
-        for(i=0;i<HACKED_ENTRIES;i++){
+        for(int i=0;i<HACKED_ENTRIES;i++){
                 ((unsigned long *)the_syscall_table)[restore[i]] = the_ni_syscall;
         }
         protect_memory();
-        printk("%s: sys-call table restored to its original content\n",MODNAME);
+        pr_info("%s: sys-call table restored to its original content\n",MODNAME);
 
+        if (password_digest) {
+            kfree(password_digest);
+            password_digest = NULL;
+        }
+
+        snapshot_exit();
+        // TODO : make functions to free all devices and their blocks
 }

@@ -1,282 +1,328 @@
-#include "include/register.h"
 #include <linux/fs.h>
 #include <linux/blkdev.h>
 #include <linux/loop.h> 
 #include <linux/kprobes.h>
-#include <linux/buffer_head.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/major.h> 
+#include <linux/namei.h>
+#include <linux/ctype.h>
+#include "include/register.h"
+#include "../snapshot/include/snapshot.h"
 
-// Global list to track active snapshot devices with spinlock protection
+/* Global list to track active snapshot devices */
 static LIST_HEAD(active_devices);
 static DEFINE_SPINLOCK(devices_lock);
 
-#include <linux/namei.h>
-#include <linux/timekeeping.h>
-
-// Ensure device names are sanitized for filesystem use
-static void sanitize_devname(char *dst, const char *src)
+/**
+ * ensure_snapshot_root_directory - Create /snapshot if it doesn't exist
+ */
+int ensure_snapshot_root_directory(void)
 {
-    int i;
-    for (i = 0; i < MAX_DEV_LEN - 1 && src[i]; i++) {
-        dst[i] = (src[i] == '/') ? '_' : src[i];
-    }
-    dst[i] = '\0';
-}
-static int ensure_snapshot_root_directory(void) {
     struct path root_path;
     struct dentry *dentry;
     int err;
 
-    // Verify if /snapshot already exists
+    /* Check if directory already exists */
     err = kern_path("/snapshot", LOOKUP_DIRECTORY, &root_path);
     if (!err) {
-        path_put(&root_path); 
+        path_put(&root_path);
         return 0;
     }
 
-    // Create /snapshot directory if it doesn't exist
+    /* Create the directory */
     dentry = kern_path_create(AT_FDCWD, "/snapshot", &root_path, LOOKUP_DIRECTORY);
     if (IS_ERR(dentry)) {
         pr_err("SNAPSHOT: Failed to prepare /snapshot path: %ld\n", PTR_ERR(dentry));
         return PTR_ERR(dentry);
     }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0)
     err = vfs_mkdir(mnt_idmap(root_path.mnt), d_inode(root_path.dentry), dentry, 0755);
+#else
+    err = vfs_mkdir(d_inode(root_path.dentry), dentry, 0755);
+#endif
+
     if (err && err != -EEXIST) {
-        pr_err("SNAPSHOT: mkdir /snapshot failed: %d\n", err);
+        pr_err("SNAPSHOT: Failed to create /snapshot: %d\n", err);
     } else {
-        pr_info("SNAPSHOT: /snapshot created.\n");
+        pr_info("SNAPSHOT: /snapshot directory ready\n");
+        err = 0;
     }
 
     done_path_create(&root_path, dentry);
     return err;
 }
 
-// Create /snapshot/devname_timestamp 
-static void create_snapshot_subdirectory(const char *raw_devname) {
-    char devname[MAX_DEV_LEN];
-    char path[PATH_MAX];
-    struct path parent_path;
-    struct dentry *dentry;
-    struct timespec64 ts;
+/**
+ * store_key_from_userspec - Convert user input to canonical device key
+ * 
+ * Handles:
+ * - Block device paths (/dev/loop0) -> backing file for loop devices
+ * - Regular file paths -> absolute path
+ */
+int store_key_from_userspec(const char *userspec, char *out, size_t len)
+{
+    struct path p;
     int err;
-
-    sanitize_devname(devname, raw_devname);
-
-    err = ensure_snapshot_root_directory();
+    
+    err = kern_path(userspec, LOOKUP_FOLLOW, &p);
     if (err) {
-        pr_err("SNAPSHOT: Unable to ensure /snapshot exists\n");
-        return;
+        pr_err("SNAPSHOT: kern_path failed for '%s': %d\n", userspec, err);
+        return err;
     }
 
-    // Get current time for timestamp
-    ktime_get_real_ts64(&ts);
-
-    // Craft the full path
-    snprintf(path, sizeof(path), "/snapshot/%s_%lld", devname, ts.tv_sec);
-    pr_info("SNAPSHOT: Creating snapshot directory: %s\n", path);
-
-    // Create the subdirectory
-    dentry = kern_path_create(AT_FDCWD, path, &parent_path, LOOKUP_DIRECTORY);
-    if (IS_ERR(dentry)) {
-        pr_err("SNAPSHOT: kern_path_create failed: %ld\n", PTR_ERR(dentry));
-        return;
+    /* Check if it's a block device */
+    if (S_ISBLK(d_inode(p.dentry)->i_mode)) {
+        struct block_device *bdev = I_BDEV(d_inode(p.dentry));
+        store_key_from_bdev(bdev, out, len);
+        path_put(&p);
+        return 0;
+    }else{
+        /* Regular file - store absolute path */
+        char *tmp = d_path(&p, out, len);
+        path_put(&p);
+        
+        if (IS_ERR(tmp)) {
+            pr_err("SNAPSHOT: d_path failed: %ld\n", PTR_ERR(tmp));
+            return PTR_ERR(tmp);
+        }
+        
+        /* Compact path to start of buffer if necessary */
+        if (tmp != out)
+            memmove(out, tmp, strlen(tmp) + 1);
+        
+        pr_info("SNAPSHOT: Canonical key: %s\n", out);
+        return 0;
     }
-
-    err = vfs_mkdir(mnt_idmap(parent_path.mnt), d_inode(parent_path.dentry), dentry, 0755);
-    if (err && err != -EEXIST) {
-        pr_err("SNAPSHOT: mkdir failed: %d\n", err);
-    } else {
-        pr_info("SNAPSHOT: Snapshot directory created: %s\n", path);
-    }
-
-    done_path_create(&parent_path, dentry);
 }
 
-
+/**
+ * handle_mount_event - Process a mount event
+ */
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(5,16,0)
 void handle_mount_event(struct block_device *bd) {
-    pr_warn("SNAPSHOT: handle_mount_event not supported for kernel < 5.16\n");
+    pr_warn("SNAPSHOT: Mount events not supported for kernel < 5.16\n");
 }
 #else
-void handle_mount_event(struct block_device *bdev) {
-    char devname[MAX_DEV_LEN] = {0};
+void handle_mount_event(struct block_device *bdev)
+{
+    char *key = kmalloc(MAX_DEV_LEN, GFP_KERNEL);
+    if (!key) return;
+    snapshot_device *sdev;
+    u64 timestamp;
+    int ret;
     
-    if (!bdev) return;
-
-    // Handle regular block devices vs loop devices differently
-    if (MAJOR(bdev->bd_dev) != LOOP_MAJOR) {
-        // For regular block devices, just get the disk name
-        snprintf(devname, MAX_DEV_LEN, "%s", bdev->bd_disk->disk_name);
-    } else {
-        // For loop devices, get the backing file path
-        struct loop_device *ldev = (struct loop_device *)bdev->bd_disk->private_data;
-        struct file *backing_file = ldev->lo_backing_file;
-        if (backing_file) {
-            char *tmp;
-            tmp = d_path(&backing_file->f_path, devname, MAX_DEV_LEN);
-            if (!IS_ERR(tmp)) {
-                snprintf(devname, MAX_DEV_LEN, "%s", tmp);
-            } else {
-                pr_err("SNAPSHOT: Failed to get backing file path\n");
-                return;
-            }
-        } else {
-            pr_err("SNAPSHOT: No backing file found\n");
-            return;
-        }
+    if (!bdev)
+        return;
+    
+    /* Get canonical key for this device */
+    store_key_from_bdev(bdev, key, MAX_DEV_LEN);
+    pr_info("SNAPSHOT: Mount event for: %s\n", key);
+    
+    /* Find if device is registered */
+    sdev = find_device(key);
+    if (!sdev) {
+        pr_debug("SNAPSHOT: Device %s not registered for snapshotting\n", key);
+        return;
     }
-    pr_info("SNAPSHOT: Mount event hooked for device: %s\n", devname);
-   
-    // Check if this device is registered for snapshotting
-    if (find_device(devname) != NULL) {
-        pr_info("SNAPSHOT: Snapshot activated for: %s\n", devname);
-        //initalize snapshot directory
-        create_snapshot_subdirectory(devname);
-        pr_info("SNAPSHOT: Created subdir for: %s\n", devname);
-    } else {
-        pr_info("SNAPSHOT: Snapshot didn't find any device for: %s\n", devname);
+    
+    if (!sdev->snapshot_active) {
+        pr_info("SNAPSHOT: Device %s registered but snapshot inactive\n", key);
+        return;
     }
+    
+    /* Start a new session (queued to workqueue) */
+    ret = start_session_for_bdev(sdev, bdev, &timestamp);
+    if (ret) {
+        pr_err("SNAPSHOT: Failed to start session: %d\n", ret);
+        return;
+    }
+    
+    pr_info("SNAPSHOT: Session queued for device: %s\n", key);
 }
 #endif
 
-/*
- * kretprobe handler for mount_bdev function
- * This gets called after mount_bdev completes and can inspect its return value
+/**
+ * mount_bdev_handler - Kretprobe handler for mount_bdev
+ * 
+ * Extract the block device and queue work to workqueue.
  */
-static int mount_bdev_handler(struct kretprobe_instance *kp, struct pt_regs *regs) {
+static int mount_bdev_handler(struct kretprobe_instance *kp, struct pt_regs *regs)
+{
     struct dentry *dentry;
-    pr_info("SNAPSHOT: mount_bdev_handler called!\n");
-
-    // Get return value from registers
-    void *ret = (void *)regs_return_value(regs);
-
+    void *ret;
+    
+    /* Get return value (should be dentry) */
+    ret = (void *)regs_return_value(regs);
+    
     if (IS_ERR_OR_NULL(ret)) {
-        pr_err("SNAPSHOT: mount_bdev returned error or NULL\n");
-        return -1;
-    }
-
-    // Get dentry from return value
-    dentry = dget((struct dentry *)ret);
-    if (!dentry) {
-        pr_err("SNAPSHOT: dget returned NULL\n");
-        return -1;
-    }
-
-    if (IS_ERR(dentry)) {
-        pr_err("SNAPSHOT: Failed to get dentry\n");
-        return -1;
-    }
-    
-    // Debug info: Print filesystem type if available
-    if (dentry->d_sb && dentry->d_sb->s_type && dentry->d_sb->s_type->name) {
-        pr_info("SNAPSHOT: filesystem type: %s\n", dentry->d_sb->s_type->name);
-    }
-    
-    // Debug info: Print block device info if available
-    if (dentry->d_sb && dentry->d_sb->s_bdev) {
-        pr_info("SNAPSHOT: block device: %s\n", dentry->d_sb->s_bdev->bd_disk->disk_name);
-    }
-    
-    // Handle the mount event if we have a block device
-    if (dentry->d_sb->s_bdev) {
-        struct block_device *bdev = dentry->d_sb->s_bdev;
-        handle_mount_event(bdev);
+        /* Mount failed, nothing to do */
         return 0;
-    } else {
-        pr_err("SNAPSHOT: No block device found\n");
-        return -1;
     }
+    
+    dentry = (struct dentry *)ret;
+    
+    /* Validate dentry structure */
+    if (!dentry->d_sb) {
+        pr_err("SNAPSHOT: Invalid dentry - no superblock\n");
+        return 0;
+    }
+    
+    /* Check if this mount has a block device */
+    if (!dentry->d_sb->s_bdev) {
+        /* Not a block device mount (e.g., tmpfs, proc) */
+        return 0;
+    }
+    
+    /* Log mount info */
+    if (dentry->d_sb->s_type && dentry->d_sb->s_type->name) {
+        pr_debug("SNAPSHOT: Mount detected - fs: %s, dev: %s\n",
+                dentry->d_sb->s_type->name,
+                dentry->d_sb->s_bdev->bd_disk->disk_name);
+    }
+    
+    /* Handle the mount event (will queue to workqueue) */
+    handle_mount_event(dentry->d_sb->s_bdev);
+    
     return 0;
 }
 
-// kretprobe structure for hooking mount_bdev function
+/* Kretprobe structure for hooking mount_bdev */
 static struct kretprobe mount_bdev_kp = {
     .kp.symbol_name = "mount_bdev",
-    .handler = mount_bdev_handler, // Function to call after mount_bdev returns
+    .handler = mount_bdev_handler,
+    .maxactive = 20, /* Handle up to 20 concurrent mounts */
 };
 
-/*
- * Install the mount hook by registering the kretprobe
+/**
+ * install_mount_hook - Install the mount event hook
  */
-int install_mount_hook(void) {
-    return register_kretprobe(&mount_bdev_kp);
+int install_mount_hook(void)
+{
+    int ret;
+    
+    ret = register_kretprobe(&mount_bdev_kp);
+    if (ret < 0) {
+        pr_err("SNAPSHOT: Failed to register kretprobe: %d\n", ret);
+        return ret;
+    }
+    
+    pr_info("SNAPSHOT: Mount hook installed successfully\n");
+    return 0;
 }
 
-/*
- * Remove the mount hook by unregistering the kretprobe
+/**
+ * remove_mount_hook - Remove the mount event hook
  */
-void remove_mount_hook(void) {
+void remove_mount_hook(void)
+{
     unregister_kretprobe(&mount_bdev_kp);
+    pr_info("SNAPSHOT: Mount hook removed (missed %d probes)\n", 
+            mount_bdev_kp.nmissed);
 }
 
-/*
- * Register a new device for snapshotting
- * @devname: Name of the device to register
- * Returns 0 on success, negative error code on failure
+/**
+ * register_device - Register a new device for snapshotting
  */
-int register_device(const char *devname) {
-    snapshot_device *new_dev;
-
-    // Check if device already exists
-    if (find_device(devname))
+int register_device(const char *devname)
+{  
+    int ret;
+    char *key = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!key) return -ENOMEM;
+    
+    /* Convert user input to canonical key */
+    ret = store_key_from_userspec(devname, key, PATH_MAX);
+    if (ret < 0) {
+        pr_err("SNAPSHOT: Invalid device specification: %s\n", devname);
+        return -EINVAL;
+    }
+    
+    /* Check if device already registered */
+    if (find_device(key)) {
+        pr_info("SNAPSHOT: Device %s already registered\n", key);
         return -EEXIST;
+    }
+    
+    /* Allocate device structure */
+    snapshot_device *new_dev = kzalloc(sizeof(*new_dev), GFP_KERNEL);
+    if (!new_dev) { kfree(key); return -ENOMEM; }
+    
+    /* Initialize device */
+    strscpy(new_dev->name, key, MAX_DEV_LEN);
+    kfree(key);
 
-    // Allocate memory for new device
-    new_dev = kmalloc(sizeof(*new_dev), GFP_KERNEL);
-    if (!new_dev)
-        return -ENOMEM;
-
-    // Initialize device structure
-    strscpy(new_dev->name, devname, MAX_DEV_LEN);
     new_dev->snapshot_active = true;
+    new_dev->bdev = NULL;
     INIT_LIST_HEAD(&new_dev->list);
-
-    // Add to global list with lock protection
+    INIT_LIST_HEAD(&new_dev->sessions);
+    spin_lock_init(&new_dev->lock);
+    
+    /* Add to global list */
     spin_lock(&devices_lock);
     list_add_tail_rcu(&new_dev->list, &active_devices);
     spin_unlock(&devices_lock);
-
-    pr_info("SNAPSHOT: Device %s registered\n", new_dev->name);
+    
+    pr_info("SNAPSHOT: Device registered: %s\n", key);
     return 0;
 }
 
-/*
- * Unregister a device from snapshotting
- * @devname: Name of the device to unregister
- * Returns 0 on success, -ENODEV if device not found
+/**
+ * unregister_device - Unregister a device from snapshotting
  */
-int unregister_device(const char *devname) {
-    snapshot_device *dev = NULL;
-
+int unregister_device(const char *devname)
+{
+    snapshot_device *dev;
+    char *key = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!key) return -ENOMEM;
+    int ret;
+    
+    /* Convert user input to canonical key */
+    ret = store_key_from_userspec(devname, key, PATH_MAX);
+    if (ret < 0)
+        return -EINVAL;
+    
     spin_lock(&devices_lock);
-    // Search for device in list
+    
+    /* Search for device */
     list_for_each_entry(dev, &active_devices, list) {
-        if (strcmp(dev->name, devname) == 0) {
-            // Remove device if found
+        if (strcmp(dev->name, key) == 0) {
+            /* Mark as inactive first */
+            dev->snapshot_active = false;
+            
+            /* Remove from list */
             list_del_rcu(&dev->list);
             spin_unlock(&devices_lock);
-            synchronize_rcu(); // Wait for any RCU readers
+            
+            /* Stop all sessions */
+            stop_sessions_for_bdev(dev);
+            
+            /* Wait for RCU readers */
+            synchronize_rcu();
+            
+            /* Free device */
             kfree(dev);
-            pr_info("SNAPSHOT: Device %s unregistered\n", devname);
+            kfree(key);
+            pr_info("SNAPSHOT: Device unregistered: %s\n", key);
             return 0;
         }
     }
+    
     spin_unlock(&devices_lock);
+    kfree(key);
+    pr_warn("SNAPSHOT: Device not found: %s\n", key);
     return -ENODEV;
 }
 
-/*
- * Find a registered device by name
- * @devname: Name of the device to find
- * Returns pointer to device if found, NULL otherwise
+/**
+ * find_device - Find a registered device by canonical key
+ * 
  * Uses RCU for safe lockless read access
  */
-snapshot_device *find_device(const char *devname) {
+snapshot_device *find_device(const char *devname)
+{
     snapshot_device *dev;
-
+    
     rcu_read_lock();
     list_for_each_entry_rcu(dev, &active_devices, list) {
         if (strcmp(dev->name, devname) == 0) {
@@ -285,5 +331,6 @@ snapshot_device *find_device(const char *devname) {
         }
     }
     rcu_read_unlock();
+    
     return NULL;
 }
