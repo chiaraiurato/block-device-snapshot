@@ -7,6 +7,7 @@
 #include <linux/major.h> 
 #include <linux/namei.h>
 #include <linux/ctype.h>
+#include <linux/limits.h>
 #include "include/register.h"
 #include "../snapshot/include/snapshot.h"
 
@@ -55,48 +56,156 @@ int ensure_snapshot_root_directory(void)
 }
 
 /**
- * store_key_from_userspec - Convert user input to canonical device key
- * 
- * Handles:
- * - Block device paths (/dev/loop0) -> backing file for loop devices
- * - Regular file paths -> absolute path
+ * validate_user_path - Validate and normalize user-provided path
+ * @userspec: User-provided path (e.g., /dev/loop0 or image file)
+ * @out: Output buffer for path
+ * @len: Length of output buffer
  */
-int store_key_from_userspec(const char *userspec, char *out, size_t len)
-{
+int validate_user_path(const char *userspec, char *out, size_t len) {
     struct path p;
+    char *tmp;
     int err;
-    
+
+    if (!userspec || !out || len == 0) {
+        pr_err("SNAPSHOT: Invalid parameters\n");
+        return -EINVAL;
+    }
+
     err = kern_path(userspec, LOOKUP_FOLLOW, &p);
     if (err) {
         pr_err("SNAPSHOT: kern_path failed for '%s': %d\n", userspec, err);
         return err;
     }
 
-    /* Check if it's a block device */
-    if (S_ISBLK(d_inode(p.dentry)->i_mode)) {
-        struct block_device *bdev = I_BDEV(d_inode(p.dentry));
-        store_key_from_bdev(bdev, out, len);
+    if (!p.dentry || !d_inode(p.dentry)) {
+        pr_err("SNAPSHOT: Invalid path structure\n");
         path_put(&p);
-        return 0;
-    }else{
-        /* Regular file - store absolute path */
-        char *tmp = d_path(&p, out, len);
-        path_put(&p);
+        return -EINVAL;
+    }
+
+    /* Get canonical path - works for both block devices and regular files */
+    tmp = d_path(&p, out, len);
+    path_put(&p);
+    
+    if (IS_ERR(tmp)) {
+        pr_err("SNAPSHOT: d_path failed: %ld\n", PTR_ERR(tmp));
+        return PTR_ERR(tmp);
+    }
+    
+    /* Compact path to start of buffer if necessary */
+    if (tmp != out)
+        memmove(out, tmp, strlen(tmp) + 1);
+
+    return 0;
+}
+/**
+ * get_loop_backing_file - Extract backing file path from loop device bdev
+ * @bdev: Block device
+ * @out: Output buffer for backing file path
+ * @len: Length of output buffer
+ */
+int get_loop_backing_file(struct block_device *bdev, char *out, size_t len) {
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
+        struct gendisk *disk;
+        struct loop_device *lo;
+        char *tmp;
         
+        if (!bdev || !out) {
+            return -EINVAL;
+        }
+        
+        disk = bdev->bd_disk;
+        if (!disk) {
+            return -EINVAL;
+        }
+        
+        /* Check if this is a loop device */
+        if (disk->major != LOOP_MAJOR) {
+            return -ENOTTY;  /* Not a loop device */
+        }
+        
+        lo = disk->private_data;
+        if (!lo || !lo->lo_backing_file) {
+            return -ENOENT;  /* No backing file */
+        }
+        
+        /* Extract backing file path */
+        tmp = d_path(&lo->lo_backing_file->f_path, out, len);
         if (IS_ERR(tmp)) {
-            pr_err("SNAPSHOT: d_path failed: %ld\n", PTR_ERR(tmp));
             return PTR_ERR(tmp);
         }
         
-        /* Compact path to start of buffer if necessary */
         if (tmp != out)
             memmove(out, tmp, strlen(tmp) + 1);
         
-        pr_info("SNAPSHOT: Canonical key: %s\n", out);
         return 0;
+    #else
+        return -ENOTSUP;
+    #endif
     }
+    
+/**
+ * get_device_name_from_bdev - Get /dev/xxx name from bdev
+ * @bdev: Block device
+ * @out: Output buffer for device name
+ * @len: Length of output buffer
+ */
+int get_device_name_from_bdev(struct block_device *bdev, char *out, size_t len) {
+    struct gendisk *disk;
+    
+    if (!bdev || !out) {
+        return -EINVAL;
+    }
+    
+    disk = bdev->bd_disk;
+    if (!disk) {
+        return -EINVAL;
+    }
+    
+    snprintf(out, len, "/dev/%s", disk->disk_name);
+    return 0;
 }
-
+    
+/**
+ * find_device_for_key - Try to find device using multiple key strategies
+ * @bdev: Block device
+ * Return: Pointer to snapshot_device if found, NULL otherwise
+ */
+snapshot_device *find_device_for_key(struct block_device *bdev) {
+    snapshot_device *sdev;
+    char *key1 = kmalloc(PATH_MAX, GFP_KERNEL);
+    char *key2 = kmalloc(PATH_MAX, GFP_KERNEL);
+    int ret;
+    
+    /* Strategy 1: Try backing file path (for loop devices) */
+    ret = get_loop_backing_file(bdev, key1, PATH_MAX);
+    if (ret == 0) {
+        pr_info("SNAPSHOT: Trying key (backing file): %s\n", key1);
+        sdev = find_device(key1);
+        if (sdev) {
+            pr_info("SNAPSHOT: Found device by backing file\n");
+            goto cleanup;
+        }
+    }
+    
+    /* Strategy 2: Try /dev/xxx path */
+    ret = get_device_name_from_bdev(bdev, key2, PATH_MAX);
+    if (ret == 0) {
+        pr_info("SNAPSHOT: Trying key (device name): %s\n", key2);
+        sdev = find_device(key2);
+        if (sdev) {
+            pr_info("SNAPSHOT: Found device by device name\n");
+            goto cleanup;
+        }
+    }
+    
+    pr_debug("SNAPSHOT: Device not found\n");
+    return NULL;
+cleanup:
+    kfree(key1);
+    kfree(key2);
+    return sdev;
+}
 /**
  * handle_mount_event - Process a mount event
  */
@@ -105,42 +214,48 @@ void handle_mount_event(struct block_device *bd) {
     pr_warn("SNAPSHOT: Mount events not supported for kernel < 5.16\n");
 }
 #else
-void handle_mount_event(struct block_device *bdev)
-{
-    char *key = kmalloc(MAX_DEV_LEN, GFP_KERNEL);
-    if (!key) return;
+void handle_mount_event(struct block_device *bdev) {
     snapshot_device *sdev;
     u64 timestamp;
     int ret;
+
+    if (!bdev) {
+        pr_warn("SNAPSHOT: Device not yet mounted\n");
+        return;  
+    }
+
+    sdev = find_device_for_key(bdev);
     
-    if (!bdev)
-        return;
-    
-    /* Get canonical key for this device */
-    store_key_from_bdev(bdev, key, MAX_DEV_LEN);
-    pr_info("SNAPSHOT: Mount event for: %s\n", key);
-    
-    /* Find if device is registered */
-    sdev = find_device(key);
     if (!sdev) {
-        pr_debug("SNAPSHOT: Device %s not registered for snapshotting\n", key);
+        pr_debug("SNAPSHOT: No registered device found for this mount\n");
         return;
     }
-    
+
     if (!sdev->snapshot_active) {
-        pr_info("SNAPSHOT: Device %s registered but snapshot inactive\n", key);
+        pr_info("SNAPSHOT: Device %s registered but snapshot inactive\n", sdev->name);
         return;
     }
-    
-    /* Start a new session (queued to workqueue) */
+
+    pr_info("SNAPSHOT: Mount event matched device: %s\n", sdev->name);
+
+    /* Set bdev if not already set */
+    spin_lock(&sdev->lock);
+    if (!sdev->bdev) {
+        sdev->bdev = bdev;
+        pr_info("SNAPSHOT: Attached bdev to device %s\n", sdev->name);
+    }
+    spin_unlock(&sdev->lock);
+
+    /* Start a new session */
     ret = start_session_for_bdev(sdev, bdev, &timestamp);
     if (ret) {
         pr_err("SNAPSHOT: Failed to start session: %d\n", ret);
         return;
     }
-    
-    pr_info("SNAPSHOT: Session queued for device: %s\n", key);
+
+    pr_info("SNAPSHOT: Session queued for device: %s\n", sdev->name);
 }
+
 #endif
 
 /**
@@ -224,100 +339,95 @@ void remove_mount_hook(void)
 
 /**
  * register_device - Register a new device for snapshotting
+ * @devname: User provided device name
  */
-int register_device(const char *devname)
-{  
+int register_device(const char *devname) {
     int ret;
     char *key = kmalloc(PATH_MAX, GFP_KERNEL);
-    if (!key) return -ENOMEM;
+    if (!key)
+        return -ENOMEM;
+    snapshot_device *new_dev;
     
-    /* Convert user input to canonical key */
-    ret = store_key_from_userspec(devname, key, PATH_MAX);
+    pr_info("SNAPSHOT: Registering device: %s\n", devname);
+
+    /* Validate user string */
+    ret = validate_user_path(devname, key, PATH_MAX);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Invalid device specification: %s\n", devname);
+        pr_err("SNAPSHOT: Failed to normalize path '%s': %d\n", devname, ret);
         return -EINVAL;
     }
-    
-    /* Check if device already registered */
+
+    /* Check if already registered */
     if (find_device(key)) {
         pr_info("SNAPSHOT: Device %s already registered\n", key);
         return -EEXIST;
     }
-    
-    /* Allocate device structure */
-    snapshot_device *new_dev = kzalloc(sizeof(*new_dev), GFP_KERNEL);
-    if (!new_dev) { kfree(key); return -ENOMEM; }
-    
-    /* Initialize device */
-    strscpy(new_dev->name, key, MAX_DEV_LEN);
-    kfree(key);
 
+    /* Allocate device structure */
+    new_dev = kzalloc(sizeof(*new_dev), GFP_KERNEL);
+    if (!new_dev) {
+        return -ENOMEM;
+    }
+
+    /* Initialize device - store the key provided from user */
+    strscpy(new_dev->name, key, MAX_DEV_LEN);
     new_dev->snapshot_active = true;
     new_dev->bdev = NULL;
     INIT_LIST_HEAD(&new_dev->list);
     INIT_LIST_HEAD(&new_dev->sessions);
     spin_lock_init(&new_dev->lock);
-    
+
     /* Add to global list */
     spin_lock(&devices_lock);
     list_add_tail_rcu(&new_dev->list, &active_devices);
     spin_unlock(&devices_lock);
-    
-    pr_info("SNAPSHOT: Device registered: %s\n", key);
+    pr_info("SNAPSHOT: Device registered as %s\n", key);
+    kfree(key);
     return 0;
 }
 
+
 /**
  * unregister_device - Unregister a device from snapshotting
+ * @devname: User provided device name
  */
-int unregister_device(const char *devname)
-{
+int unregister_device(const char *devname) {
     snapshot_device *dev;
     char *key = kmalloc(PATH_MAX, GFP_KERNEL);
-    if (!key) return -ENOMEM;
+    if (!key)
+        return -ENOMEM;
     int ret;
-    
-    /* Convert user input to canonical key */
-    ret = store_key_from_userspec(devname, key, PATH_MAX);
-    if (ret < 0)
+
+    /* Normalize the path to match registration */
+    ret = validate_user_path(devname, key, PATH_MAX);
+    if (ret < 0) {
         return -EINVAL;
-    
+    }
+
     spin_lock(&devices_lock);
-    
-    /* Search for device */
     list_for_each_entry(dev, &active_devices, list) {
         if (strcmp(dev->name, key) == 0) {
-            /* Mark as inactive first */
             dev->snapshot_active = false;
-            
-            /* Remove from list */
             list_del_rcu(&dev->list);
             spin_unlock(&devices_lock);
-            
-            /* Stop all sessions */
+
             stop_sessions_for_bdev(dev);
-            
-            /* Wait for RCU readers */
             synchronize_rcu();
-            
-            /* Free device */
             kfree(dev);
-            kfree(key);
+            
             pr_info("SNAPSHOT: Device unregistered: %s\n", key);
             return 0;
         }
     }
-    
     spin_unlock(&devices_lock);
-    kfree(key);
     pr_warn("SNAPSHOT: Device not found: %s\n", key);
+    kfree(key);
     return -ENODEV;
 }
 
 /**
- * find_device - Find a registered device by canonical key
- * 
- * Uses RCU for safe lockless read access
+ * find_device - Find a registered device by its key
+ * @devname: Key to search for
  */
 snapshot_device *find_device(const char *devname)
 {

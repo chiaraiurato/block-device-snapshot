@@ -31,12 +31,36 @@ void store_key_from_bdev(struct block_device *bdev, char *out, size_t len)
     }
 
     disk = bdev->bd_disk;
+
+    if (!disk) {
+        pr_err("SNAPSHOT: bdev->bd_disk is NULL (device not initialized)\n");
+        snprintf(out, len, "uninitialized_device");
+        return;
+    }
     
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
     /* Check if this is a loop device */
     if (disk->major == LOOP_MAJOR) {
+        // struct loop_device *lo = disk->private_data;
+        
+        // if (lo && lo->lo_backing_file) {
+        //     /* Get the backing file path */
+        //     char *tmp;
+        //     struct path *path = &lo->lo_backing_file->f_path;
+            
+        //     tmp = d_path(path, out, len);
+        //     if (IS_ERR(tmp)) {
+        //         pr_err("SNAPSHOT: Failed to get loop backing file path\n");
+        //         snprintf(out, len, "/dev/%s", disk->disk_name);
+        //     } else if (tmp != out) {
+        //         memmove(out, tmp, strlen(tmp) + 1);
+        //     }
+        //     pr_info("SNAPSHOT: Loop device key: %s\n", out);
+        //     return;
+        // }
         struct loop_device *lo = disk->private_data;
         
+        /* Check if loop device has backing file */
         if (lo && lo->lo_backing_file) {
             /* Get the backing file path */
             char *tmp;
@@ -50,6 +74,12 @@ void store_key_from_bdev(struct block_device *bdev, char *out, size_t len)
                 memmove(out, tmp, strlen(tmp) + 1);
             }
             pr_info("SNAPSHOT: Loop device key: %s\n", out);
+            return;
+        } else {
+            /* Loop device exists but has no backing file yet */
+            pr_warn("SNAPSHOT: Loop device %s has no backing file (not set up yet)\n", 
+                    disk->disk_name);
+            snprintf(out, len, "/dev/%s", disk->disk_name);
             return;
         }
     }
@@ -210,8 +240,6 @@ static int create_snapshot_subdirectory(snapshot_session *session,
     snprintf(path, PATH_MAX, "/snapshot/%s_%lld",
              basename_only, (long long)ts.tv_sec);
     
-    pr_info("SNAPSHOT: Creating directory: %s\n", path);
-    
     /* Create the directory */
     dentry = kern_path_create(AT_FDCWD, path, &parent_path, LOOKUP_DIRECTORY);
     if (IS_ERR(dentry)) {
@@ -247,54 +275,50 @@ static int create_snapshot_subdirectory(snapshot_session *session,
  * mount_work_handler - Workqueue handler for mount events
  * 
  */
-static void mount_work_handler(struct work_struct *work)
-{
+static void mount_work_handler(struct work_struct *work) {
     struct mount_work *mw = container_of(work, struct mount_work, work);
     snapshot_device *sdev;
     snapshot_session *session;
     u64 timestamp;
     int ret;
+
+    /* Device was already found in handle_mount_event, it's passed via work */
+    sdev = mw->sdev;  // ← You need to add sdev to mount_work struct
     
-    store_key_from_bdev(mw->bdev, mw->key, sizeof(mw->key));
-    pr_info("SNAPSHOT: Mount event for: %s\n", mw->key);
-    /* Find the registered device */
-    sdev = find_device(mw->key);
     if (!sdev) {
-        pr_info("SNAPSHOT: No registered device for: %s\n", mw->key);
+        pr_err("SNAPSHOT: No device in mount_work\n");
         goto cleanup;
     }
-    
-    /* Check if snapshot is active */
+
+    /* Check if snapshot is still active */
     if (!sdev->snapshot_active) {
-        pr_info("SNAPSHOT: Snapshot not active for: %s\n", mw->key);
+        pr_info("SNAPSHOT: Snapshot no longer active for: %s\n", sdev->name);
         goto cleanup;
     }
-    
+
     /* Create new session */
     timestamp = ktime_get_real_ns();
     session = create_session(sdev, timestamp);
     if (!session) {
-        pr_err("SNAPSHOT: Failed to create session for: %s\n", mw->key);
+        pr_err("SNAPSHOT: Failed to create session for: %s\n", sdev->name);
         goto cleanup;
     }
-    
-    /* Create snapshot subdirectory */
-    ret = create_snapshot_subdirectory(session, mw->key);
+
+    /* Create snapshot subdirectory - use the device name (key) from sdev */
+    ret = create_snapshot_subdirectory(session, sdev->name);
     if (ret) {
         pr_err("SNAPSHOT: Failed to create directory: %d\n", ret);
         destroy_session(session);
         goto cleanup;
     }
-    
+
     /* Add session to device */
     spin_lock(&sdev->lock);
-    sdev->bdev = mw->bdev;
     list_add_tail(&session->list, &sdev->sessions);
     spin_unlock(&sdev->lock);
-    
-    pr_info("SNAPSHOT: Session %llu started for device: %s\n", 
-            timestamp, mw->key);
-    
+
+    pr_info("SNAPSHOT: Session %llu started for device: %s\n", timestamp, sdev->name);
+
 cleanup:
     kfree(mw);
 }
@@ -304,31 +328,29 @@ cleanup:
  * 
  * Called from kprobe handler
  */
-int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, 
-                           u64 *out_ts)
-{
+int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts) {
     struct mount_work *mw;
-    
+
     /* Allocate work structure */
     mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
     if (!mw)
         return -ENOMEM;
-    
+
     /* Initialize work */
     INIT_WORK(&mw->work, mount_work_handler);
     mw->bdev = bdev;
-    // store_key_from_bdev(bdev, mw->key, sizeof(mw->key));
-    
+    mw->sdev = sdev;  // ← Pass the device directly
+
     /* Queue the work */
     if (!queue_work(snapshot_wq, &mw->work)) {
         pr_err("SNAPSHOT: Failed to queue mount work\n");
         kfree(mw);
         return -EAGAIN;
     }
-    
+
     if (out_ts)
         *out_ts = ktime_get_real_ns();
-    
+
     return 0;
 }
 

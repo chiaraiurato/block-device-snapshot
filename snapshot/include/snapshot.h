@@ -9,20 +9,6 @@
 #define MAX_DEV_LEN 256
 #define DEFAULT_BLOCK_SIZE 4096
 
-
-/**
- * struct mount_work - Work structure for async mount handling
- * @work: Work queue item
- * @bdev: Block device being mounted
- * @key: Device key (canonical path)
- */
-struct mount_work {
-    struct work_struct work;
-    struct block_device *bdev;
-    char key[PATH_MAX];
-};
-
-
 /**
  * struct block_data - Stored block data
  * @sector: Sector number
@@ -74,6 +60,19 @@ typedef struct snapshot_device {
     struct list_head sessions;
     struct block_device *bdev;
 } snapshot_device;
+
+
+/**
+ * struct mount_work - Work structure for async mount handling
+ * @work: Work queue item
+ * @bdev: Block device being mounted
+ * @key: Device key (canonical path)
+ */
+struct mount_work {
+    struct work_struct work;
+    struct block_device *bdev;
+    snapshot_device *sdev;
+};
 
 /* Core snapshot functions */
 void store_key_from_bdev(struct block_device *bdev, char *out, size_t len);
