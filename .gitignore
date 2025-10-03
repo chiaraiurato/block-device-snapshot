@@ -35,6 +35,9 @@ user/user.out
 # System files
 singlefilemakefs
 
+# Mount directory
+mount/
+
 # Kernel build artifacts
 *.unsigned
 *.dwo

@@ -319,11 +319,9 @@ int install_mount_hook(void)
     
     ret = register_kretprobe(&mount_bdev_kp);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to register kretprobe: %d\n", ret);
+        pr_err("SNAPSHOT: Failed to register kretprobe on mount: %d\n", ret);
         return ret;
     }
-    
-    pr_info("SNAPSHOT: Mount hook installed successfully\n");
     return 0;
 }
 
@@ -442,5 +440,19 @@ snapshot_device *find_device(const char *devname)
     }
     rcu_read_unlock();
     
+    return NULL;
+}
+
+struct snapshot_device *find_device_by_bdev(struct block_device *bdev)
+{
+    struct snapshot_device *dev;
+    rcu_read_lock();
+    list_for_each_entry_rcu(dev, &active_devices, list) {
+        if (READ_ONCE(dev->bdev) == bdev) {
+            rcu_read_unlock();
+            return dev;
+        }
+    }
+    rcu_read_unlock();
     return NULL;
 }

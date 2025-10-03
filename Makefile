@@ -1,7 +1,7 @@
 obj-m += the_block-device-snapshot.o
 the_block-device-snapshot-objs += block-device-snapshot.o lib/scth.o utils/auth.o register/register.o snapshot/snapshot.o
 
-LOG_DIRECTORY_PATH = /tmp/bdevsnap.log
+MOUNT_PATH = mount
 USER_APP = user/user.out
 USER_SRC = user/user.c
 SINGLEFILE_FS_DIR = singlefile-FS
@@ -19,7 +19,7 @@ compile:
 create-singlefilefs:
 	dd bs=4096 count=100 if=/dev/zero of=image
 	./singlefilemakefs image
-	mkdir $(LOG_DIRECTORY_PATH)
+	mkdir $(MOUNT_PATH)
 
 mount:
 	@echo "Mounting modules..."
@@ -62,11 +62,11 @@ mount:
 	
 mount-fs:
 	sudo insmod $(SINGLEFILE_FS_DIR)/singlefilefs.ko
-	sudo mount -o loop -t singlefilefs image $(LOG_DIRECTORY_PATH)/
+	sudo mount -o loop -t singlefilefs image ./$(MOUNT_PATH)/
 	@echo "Modules mounted successfully"
 
 unmount-fs:
-	sudo umount $(LOG_DIRECTORY_PATH)/ -f
+	sudo umount $(MOUNT_PATH)/ -f
 
 compile-user:
 	@echo "Compiling user application..."
@@ -84,7 +84,7 @@ clean-compile:
 	@echo "Cleaning up..."
 	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD)/the_usctm clean
 	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) clean
-	@rm -rf $(LOG_DIRECTORY_PATH)
+	@rm -rf $(MOUNT_PATH)
 	@echo "Cleanup completed"
 	
 clean-fs:

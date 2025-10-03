@@ -253,6 +253,13 @@ int init_module(void) {
         }
         printk("%s: register mount_bdev() hook successfully\n", MODNAME);
         
+        ret = install_write_hook();
+        if (ret < 0) {
+            printk("%s: Error while hooking write_dirty_buffer()\n", MODNAME);
+            return ret;
+        }
+        printk("%s: register write_dirty_buffer() hook successfully\n", MODNAME);
+        
         /* create workqueue for mounting sdev*/
         snapshot_init();
 
@@ -264,8 +271,10 @@ int init_module(void) {
 void cleanup_module(void) {
         // snapshot_device *dev, *tmp;
         printk("%s: shutting down\n",MODNAME);
-
+        //remove all hooks
+        // TODO : refactor to remove all hooks in a single function
         remove_mount_hook();
+        remove_write_hook();
         unprotect_memory();
         for(int i=0;i<HACKED_ENTRIES;i++){
                 ((unsigned long *)the_syscall_table)[restore[i]] = the_ni_syscall;
@@ -278,6 +287,5 @@ void cleanup_module(void) {
             password_digest = NULL;
         }
 
-        snapshot_exit();
-        // TODO : make functions to free all devices and their blocks
+        snapshot_exit();   
 }

@@ -25,7 +25,7 @@ int main(int argc, char *argv[])
 	struct onefilefs_inode file_inode;
 	char *block_padding;
 	struct stat stat_buf;
-	char *file_body = "Wathever content you would like.\n";//this is the default content of the unique file 
+	char *file_body = "";//this is the default content of the unique file 
 
 	if (argc != 2) {
 		printf("Usage: mkfs-singlefilefs <device>\n");

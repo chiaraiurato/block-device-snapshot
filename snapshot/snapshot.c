@@ -9,6 +9,9 @@
 #include <linux/timekeeping.h>
 #include <linux/version.h>
 #include <linux/limits.h>
+#include <linux/blkdev.h>
+#include <linux/kprobes.h>
+#include <linux/buffer_head.h>
 #include "include/snapshot.h"
 #include "../register/include/register.h"
 
@@ -41,23 +44,6 @@ void store_key_from_bdev(struct block_device *bdev, char *out, size_t len)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
     /* Check if this is a loop device */
     if (disk->major == LOOP_MAJOR) {
-        // struct loop_device *lo = disk->private_data;
-        
-        // if (lo && lo->lo_backing_file) {
-        //     /* Get the backing file path */
-        //     char *tmp;
-        //     struct path *path = &lo->lo_backing_file->f_path;
-            
-        //     tmp = d_path(path, out, len);
-        //     if (IS_ERR(tmp)) {
-        //         pr_err("SNAPSHOT: Failed to get loop backing file path\n");
-        //         snprintf(out, len, "/dev/%s", disk->disk_name);
-        //     } else if (tmp != out) {
-        //         memmove(out, tmp, strlen(tmp) + 1);
-        //     }
-        //     pr_info("SNAPSHOT: Loop device key: %s\n", out);
-        //     return;
-        // }
         struct loop_device *lo = disk->private_data;
         
         /* Check if loop device has backing file */
@@ -107,6 +93,7 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp)
     
     mutex_init(&session->dir_mtx);
     xa_init(&session->saved_blocks);
+    xa_init(&session->pending_block);
     INIT_LIST_HEAD(&session->list);
     atomic_set(&session->ref_count, 1);
     
@@ -136,6 +123,7 @@ void destroy_session(snapshot_session *session)
     }
     
     xa_destroy(&session->saved_blocks);
+    xa_destroy(&session->pending_block);
     mutex_destroy(&session->dir_mtx);
     kfree(session);
 }
@@ -199,7 +187,7 @@ bool is_block_saved(snapshot_session *session, sector_t sector)
 /**
  * create_snapshot_subdirectory - Create timestamped directory for session
  * 
- * Called from workqueue context - safe to use blocking operations
+ * Called from workqueue context 
  */
 static int create_snapshot_subdirectory(snapshot_session *session, 
                                        const char *raw_devname)
@@ -283,7 +271,7 @@ static void mount_work_handler(struct work_struct *work) {
     int ret;
 
     /* Device was already found in handle_mount_event, it's passed via work */
-    sdev = mw->sdev;  // ← You need to add sdev to mount_work struct
+    sdev = mw->sdev;
     
     if (!sdev) {
         pr_err("SNAPSHOT: No device in mount_work\n");
@@ -304,7 +292,7 @@ static void mount_work_handler(struct work_struct *work) {
         goto cleanup;
     }
 
-    /* Create snapshot subdirectory - use the device name (key) from sdev */
+    /* Create snapshot subdirectory - use the device name from sdev */
     ret = create_snapshot_subdirectory(session, sdev->name);
     if (ret) {
         pr_err("SNAPSHOT: Failed to create directory: %d\n", ret);
@@ -316,6 +304,9 @@ static void mount_work_handler(struct work_struct *work) {
     spin_lock(&sdev->lock);
     list_add_tail(&session->list, &sdev->sessions);
     spin_unlock(&sdev->lock);
+
+    /*Assign active session for device*/
+    rcu_assign_pointer(sdev->active_session, session); 
 
     pr_info("SNAPSHOT: Session %llu started for device: %s\n", timestamp, sdev->name);
 
@@ -339,7 +330,7 @@ int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64
     /* Initialize work */
     INIT_WORK(&mw->work, mount_work_handler);
     mw->bdev = bdev;
-    mw->sdev = sdev;  // ← Pass the device directly
+    mw->sdev = sdev; 
 
     /* Queue the work */
     if (!queue_work(snapshot_wq, &mw->work)) {
@@ -367,7 +358,8 @@ int stop_sessions_for_bdev(snapshot_device *sdev)
     pr_info("SNAPSHOT: Stopping all sessions for: %s\n", sdev->name);
     
     spin_lock(&sdev->lock);
-    
+    rcu_assign_pointer(sdev->active_session, NULL);
+    synchronize_rcu(); 
     /* Remove and destroy all sessions */
     list_for_each_entry_safe(session, tmp, &sdev->sessions, list) {
         list_del(&session->list);
@@ -382,6 +374,89 @@ int stop_sessions_for_bdev(snapshot_device *sdev)
     spin_unlock(&sdev->lock);
     
     return 0;
+}
+
+
+/**
+ * write_dirty_buffer_handler - Kretprobe handler for write_dirty_buffer
+ * 
+ */
+static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    struct buffer_head *bh = (struct buffer_head *)regs->di;
+    snapshot_device *sdev;
+    snapshot_session *session;
+    sector_t key;
+    int ret;
+    pr_info("SNAPSHOT: Inside hook write_dirty_buffer\n");
+    if (!bh){
+        pr_info("SNAPSHOT: bh is NULL\n");
+        return 0;
+    } 
+
+    /* Search if the write is coming for the device mounted before*/
+    sdev = find_device_by_bdev(bh->b_bdev);
+    if (!sdev || !READ_ONCE(sdev->snapshot_active) ||
+        READ_ONCE(sdev->bdev) != bh->b_bdev){
+        pr_info("SNAPSHOT: No active snapshot for device %s\n", bh->b_bdev->bd_disk->disk_name);
+        return 0;
+    }
+    
+    session = get_active_session_rcu(sdev);
+    if (!session) return 0;
+    key = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
+    
+    //NB: this saves block=2 → data block and block=1 → inode block
+    ret = xa_insert(&session->pending_block, key, xa_mk_value(1), GFP_ATOMIC);
+    if (ret == -EBUSY) {
+        /* the entry is already saved */
+        put_session(session);
+        pr_info("SNAPSHOT: Block %llu already pending\n", (unsigned long long)key);
+        return 0;
+    }
+    if (ret == -ENOMEM) {
+        pr_warn_ratelimited("SNAPSHOT: Memory allocation failed for pending block %llu\n", (unsigned long long)key);
+        put_session(session);
+        return 0;
+    }
+
+    /* TODO: Add to workqueue to manage the main logic for snapshot */
+    pr_info("SNAPSHOT: Adding block dev=%s block=%llu size=%zu\n",
+            bh->b_bdev->bd_disk->disk_name,
+            (unsigned long long)bh->b_blocknr,
+            (size_t)bh->b_size);
+    put_session(session);
+    return 0;
+
+}
+
+
+static struct kprobe write_dirty_buffer_kp = {
+    .symbol_name = "write_dirty_buffer",
+    .pre_handler = write_dirty_buffer_handler,
+};
+
+/**
+ * install_write_hook - Install the write event hook
+ */
+int install_write_hook(void)
+{
+    int ret;
+    
+    ret = register_kprobe(&write_dirty_buffer_kp);
+    if (ret < 0) {
+        pr_err("SNAPSHOT: Failed to register kprobe on write: %d\n", ret);
+        return ret;
+    }
+    return 0;
+}
+
+/**
+ * remove_write_hook - Remove the write event hook
+ */
+void remove_write_hook(void)
+{
+    unregister_kprobe(&write_dirty_buffer_kp);
 }
 
 /**

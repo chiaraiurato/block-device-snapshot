@@ -74,6 +74,12 @@ int store_key_from_userspec(const char *userspec, char *out, size_t len);
  * Create /snapshot directory if it doesn't exist
  */
 int ensure_snapshot_root_directory(void);
+/**
+ * find_device_for_key - Try to find device using bdev
+ */
+snapshot_device *find_device_for_key(struct block_device *bdev);
+
+struct snapshot_device *find_device_by_bdev(struct block_device *bdev);
 /* Kernel Probe Functions */
 
 /**
