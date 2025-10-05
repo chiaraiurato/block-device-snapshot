@@ -165,45 +165,33 @@ int get_device_name_from_bdev(struct block_device *bdev, char *out, size_t len) 
     snprintf(out, len, "/dev/%s", disk->disk_name);
     return 0;
 }
-    
+
 /**
- * find_device_for_key - Try to find device using multiple key strategies
- * @bdev: Block device
- * Return: Pointer to snapshot_device if found, NULL otherwise
+ * find_device_for_bdev - Try to find device using bdev
  */
-snapshot_device *find_device_for_key(struct block_device *bdev) {
-    snapshot_device *sdev;
-    char *key1 = kmalloc(PATH_MAX, GFP_KERNEL);
-    char *key2 = kmalloc(PATH_MAX, GFP_KERNEL);
+snapshot_device *find_device_for_bdev(struct block_device *bdev)
+{
+    struct inode *inode;
+    snapshot_device *sdev = NULL;
+    char *key = kmalloc(PATH_MAX, GFP_KERNEL);
     int ret;
-    
-    /* Strategy 1: Try backing file path (for loop devices) */
-    ret = get_loop_backing_file(bdev, key1, PATH_MAX);
-    if (ret == 0) {
-        pr_info("SNAPSHOT: Trying key (backing file): %s\n", key1);
-        sdev = find_device(key1);
-        if (sdev) {
-            pr_info("SNAPSHOT: Found device by backing file\n");
-            goto cleanup;
-        }
+
+    if (!bdev)
+        return NULL;
+
+    /* Block device */
+    if (MAJOR(bdev->bd_dev) != LOOP_MAJOR) {
+        ret = get_device_name_from_bdev(bdev, key, PATH_MAX);
+        if (ret == 0)
+            sdev = find_device(key);
     }
-    
-    /* Strategy 2: Try /dev/xxx path */
-    ret = get_device_name_from_bdev(bdev, key2, PATH_MAX);
-    if (ret == 0) {
-        pr_info("SNAPSHOT: Trying key (device name): %s\n", key2);
-        sdev = find_device(key2);
-        if (sdev) {
-            pr_info("SNAPSHOT: Found device by device name\n");
-            goto cleanup;
-        }
+    /* Loop device */
+    else {
+        ret = get_loop_backing_file(bdev, key, PATH_MAX);
+        if (ret == 0)
+            sdev = find_device(key);
     }
-    
-    pr_debug("SNAPSHOT: Device not found\n");
-    return NULL;
-cleanup:
-    kfree(key1);
-    kfree(key2);
+
     return sdev;
 }
 /**
@@ -224,8 +212,7 @@ void handle_mount_event(struct block_device *bdev) {
         return;  
     }
 
-    sdev = find_device_for_key(bdev);
-    
+    sdev = find_device_for_bdev(bdev);
     if (!sdev) {
         pr_debug("SNAPSHOT: No registered device found for this mount\n");
         return;
@@ -351,7 +338,7 @@ int register_device(const char *devname) {
     /* Validate user string */
     ret = validate_user_path(devname, key, PATH_MAX);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to normalize path '%s': %d\n", devname, ret);
+        pr_err("SNAPSHOT: Failed to validate path '%s': %d\n", devname, ret);
         return -EINVAL;
     }
 

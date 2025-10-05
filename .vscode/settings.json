@@ -18,7 +18,8 @@
         "sched.h": "c",
         "mount.h": "c",
         "singlefilefs.h": "c",
-        "major.h": "c"
+        "major.h": "c",
+        "limits.h": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

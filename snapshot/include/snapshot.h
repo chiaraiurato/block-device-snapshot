@@ -45,6 +45,7 @@ typedef struct {
 
 /**
  * struct snapshot_device - Represents a snapshot device
+ * @dev: (major : minor) device number
  * @name: Device name 
  * @snapshot_active: Flag indicating if snapshot is active
  * @list: List head for linking devices
@@ -54,6 +55,7 @@ typedef struct {
  * @bdev: Associated block device (if mounted)
  */
 typedef struct snapshot_device {
+    dev_t dev;
     char name[MAX_DEV_LEN];
     bool snapshot_active;
     struct list_head list;
@@ -78,7 +80,6 @@ struct mount_work {
 };
 
 /* Core snapshot functions */
-void store_key_from_bdev(struct block_device *bdev, char *out, size_t len);
 int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts);
 int stop_sessions_for_bdev(snapshot_device *sdev);
 
@@ -86,8 +87,6 @@ int stop_sessions_for_bdev(snapshot_device *sdev);
 /* Session management */
 snapshot_session *create_session(snapshot_device *sdev, u64 timestamp);
 void destroy_session(snapshot_session *session);
-//TODO: understand if lookup by timestamp is needed
-// snapshot_session *find_session_by_timestamp(snapshot_device *sdev, u64 timestamp);
 
 /* Block tracking */
 int save_block_to_session(snapshot_session *session, sector_t sector, 

@@ -9,7 +9,6 @@
 #include <linux/timekeeping.h>
 #include <linux/version.h>
 #include <linux/limits.h>
-#include <linux/blkdev.h>
 #include <linux/kprobes.h>
 #include <linux/buffer_head.h>
 #include "include/snapshot.h"
@@ -24,57 +23,57 @@ static struct workqueue_struct *snapshot_wq;
  * For loop devices: returns backing file path
  * For other devices: returns /dev/xxx path
  */
-void store_key_from_bdev(struct block_device *bdev, char *out, size_t len)
-{
-    struct gendisk *disk;
+// void store_key_from_bdev(struct block_device *bdev, char *out, size_t len)
+// {
+//     struct gendisk *disk;
     
-    if (!bdev || !out) {
-        pr_err("SNAPSHOT: Invalid parameters to store_key_from_bdev\n");
-        return;
-    }
+//     if (!bdev || !out) {
+//         pr_err("SNAPSHOT: Invalid parameters to store_key_from_bdev\n");
+//         return;
+//     }
 
-    disk = bdev->bd_disk;
+//     disk = bdev->bd_disk;
 
-    if (!disk) {
-        pr_err("SNAPSHOT: bdev->bd_disk is NULL (device not initialized)\n");
-        snprintf(out, len, "uninitialized_device");
-        return;
-    }
+//     if (!disk) {
+//         pr_err("SNAPSHOT: bdev->bd_disk is NULL (device not initialized)\n");
+//         snprintf(out, len, "uninitialized_device");
+//         return;
+//     }
     
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
-    /* Check if this is a loop device */
-    if (disk->major == LOOP_MAJOR) {
-        struct loop_device *lo = disk->private_data;
+// #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
+//     /* Check if this is a loop device */
+//     if (disk->major == LOOP_MAJOR) {
+//         struct loop_device *lo = disk->private_data;
         
-        /* Check if loop device has backing file */
-        if (lo && lo->lo_backing_file) {
-            /* Get the backing file path */
-            char *tmp;
-            struct path *path = &lo->lo_backing_file->f_path;
+//         /* Check if loop device has backing file */
+//         if (lo && lo->lo_backing_file) {
+//             /* Get the backing file path */
+//             char *tmp;
+//             struct path *path = &lo->lo_backing_file->f_path;
             
-            tmp = d_path(path, out, len);
-            if (IS_ERR(tmp)) {
-                pr_err("SNAPSHOT: Failed to get loop backing file path\n");
-                snprintf(out, len, "/dev/%s", disk->disk_name);
-            } else if (tmp != out) {
-                memmove(out, tmp, strlen(tmp) + 1);
-            }
-            pr_info("SNAPSHOT: Loop device key: %s\n", out);
-            return;
-        } else {
-            /* Loop device exists but has no backing file yet */
-            pr_warn("SNAPSHOT: Loop device %s has no backing file (not set up yet)\n", 
-                    disk->disk_name);
-            snprintf(out, len, "/dev/%s", disk->disk_name);
-            return;
-        }
-    }
-#endif
+//             tmp = d_path(path, out, len);
+//             if (IS_ERR(tmp)) {
+//                 pr_err("SNAPSHOT: Failed to get loop backing file path\n");
+//                 snprintf(out, len, "/dev/%s", disk->disk_name);
+//             } else if (tmp != out) {
+//                 memmove(out, tmp, strlen(tmp) + 1);
+//             }
+//             pr_info("SNAPSHOT: Loop device key: %s\n", out);
+//             return;
+//         } else {
+//             /* Loop device exists but has no backing file yet */
+//             pr_warn("SNAPSHOT: Loop device %s has no backing file (not set up yet)\n", 
+//                     disk->disk_name);
+//             snprintf(out, len, "/dev/%s", disk->disk_name);
+//             return;
+//         }
+//     }
+// #endif
 
-    /* For non-loop devices or when backing file is unavailable */
-    pr_info("SNAPSHOT: fallback store_key_from_bdev for device: %s\n", bdev->bd_disk->disk_name);
-    strscpy(out, bdev->bd_disk->disk_name, len); 
-}
+//     /* For non-loop devices or when backing file is unavailable */
+//     pr_info("SNAPSHOT: fallback store_key_from_bdev for device: %s\n", bdev->bd_disk->disk_name);
+//     strscpy(out, bdev->bd_disk->disk_name, len); 
+// }
 
 /**
  * create_session - Create a new snapshot session
@@ -395,7 +394,7 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
     } 
 
     /* Search if the write is coming for the device mounted before*/
-    sdev = find_device_by_bdev(bh->b_bdev);
+    sdev = find_device_for_bdev(bh->b_bdev);
     if (!sdev || !READ_ONCE(sdev->snapshot_active) ||
         READ_ONCE(sdev->bdev) != bh->b_bdev){
         pr_info("SNAPSHOT: No active snapshot for device %s\n", bh->b_bdev->bd_disk->disk_name);
