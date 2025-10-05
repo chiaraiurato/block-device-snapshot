@@ -171,9 +171,8 @@ int get_device_name_from_bdev(struct block_device *bdev, char *out, size_t len) 
  */
 snapshot_device *find_device_for_bdev(struct block_device *bdev)
 {
-    struct inode *inode;
     snapshot_device *sdev = NULL;
-    char *key = kmalloc(PATH_MAX, GFP_KERNEL);
+    char *key = kmalloc(PATH_MAX, GFP_ATOMIC);
     int ret;
 
     if (!bdev)
@@ -371,7 +370,6 @@ int register_device(const char *devname) {
     return 0;
 }
 
-
 /**
  * unregister_device - Unregister a device from snapshotting
  * @devname: User provided device name
@@ -442,4 +440,9 @@ struct snapshot_device *find_device_by_bdev(struct block_device *bdev)
     }
     rcu_read_unlock();
     return NULL;
+}
+
+int restore_device(const char *devname){
+    pr_info("SNAPSHOT: Restoring snapshot for device %s\n", devname);
+    return 0;
 }

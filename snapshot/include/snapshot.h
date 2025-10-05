@@ -5,18 +5,20 @@
 #include <linux/spinlock.h>
 #include <linux/limits.h>
 #include <linux/types.h>
+#include <linux/buffer_head.h>
+#include <linux/bio.h>
 /* Maximum length of a device name */
 #define MAX_DEV_LEN 256
 #define DEFAULT_BLOCK_SIZE 4096
 
-/**
- * struct block_data - Stored block data
- * @sector: Sector number
- * @data: Block content
+
+/** struct block_data - Stored block data 
+ * @sector: Sector number 
+ * @data: Block content 
  * @size: Size of the block
- */
-struct block_data {
-    sector_t sector;
+ */ 
+struct block_data { 
+    sector_t sector; 
     void *data;
     size_t size;
 };
@@ -41,6 +43,10 @@ typedef struct {
     struct xarray pending_block; 
     struct list_head list;
     atomic_t ref_count;
+    struct file *map_file;        
+    struct file *data_file;       
+    loff_t map_pos;
+    loff_t data_pos;
 } snapshot_session;
 
 /**
@@ -64,6 +70,14 @@ typedef struct snapshot_device {
     snapshot_session __rcu *active_session;
 } snapshot_device;
 
+struct cow_work {
+    struct work_struct work;
+    struct block_device *bdev;     /* target to read the ORIGINAL block from */
+    snapshot_session *session;     /* holds refcount while work runs */
+    sector_t blocknr;              /* FS block number */
+    unsigned int size;             /* FS block size (bytes) */
+    sector_t sector_key;           /* key used in xarrays: sector units (512B) */
+};
 
 /**
  * struct mount_work - Work structure for async mount handling
@@ -90,6 +104,15 @@ void destroy_session(snapshot_session *session);
 int save_block_to_session(snapshot_session *session, sector_t sector, 
                           const void *data, size_t size);
 bool is_block_saved(snapshot_session *session, sector_t sector);
+
+int queue_cow_for_block(snapshot_session *session,
+    struct block_device *bdev,
+    sector_t blocknr,
+    unsigned int size,
+    sector_t sector_key);
+
+/* Run restore (device unmounted): write saved blocks back */
+int restore_snapshot_for_devname(const char *devname);
 
 static inline snapshot_session *get_active_session_rcu(snapshot_device *sdev)
 {

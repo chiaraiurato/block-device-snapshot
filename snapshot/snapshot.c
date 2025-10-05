@@ -17,63 +17,130 @@
 /* Workqueue for handling mount events */
 static struct workqueue_struct *snapshot_wq;
 
-/**
- * store_key_from_bdev - Extract canonical key from block device
- * 
- * For loop devices: returns backing file path
- * For other devices: returns /dev/xxx path
- */
-// void store_key_from_bdev(struct block_device *bdev, char *out, size_t len)
-// {
-//     struct gendisk *disk;
-    
-//     if (!bdev || !out) {
-//         pr_err("SNAPSHOT: Invalid parameters to store_key_from_bdev\n");
-//         return;
-//     }
+struct snapshot_rec {
+    u64 sector;   /* chiave in settori (512B) */
+    u32 size;     /* bytes */
+    u64 offset;   /* offset dentro blocks.dat */
+} __packed;
 
-//     disk = bdev->bd_disk;
+static void cow_work_handler(struct work_struct *w)
+{
+    struct cow_work *cw = container_of(w, struct cow_work, work);
+    snapshot_session *session = cw->session;
+    struct buffer_head *bh = NULL;
+    struct snapshot_rec rec;
+    ssize_t wrc;
+    int ret;
 
-//     if (!disk) {
-//         pr_err("SNAPSHOT: bdev->bd_disk is NULL (device not initialized)\n");
-//         snprintf(out, len, "uninitialized_device");
-//         return;
-//     }
-    
-// #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)
-//     /* Check if this is a loop device */
-//     if (disk->major == LOOP_MAJOR) {
-//         struct loop_device *lo = disk->private_data;
-        
-//         /* Check if loop device has backing file */
-//         if (lo && lo->lo_backing_file) {
-//             /* Get the backing file path */
-//             char *tmp;
-//             struct path *path = &lo->lo_backing_file->f_path;
-            
-//             tmp = d_path(path, out, len);
-//             if (IS_ERR(tmp)) {
-//                 pr_err("SNAPSHOT: Failed to get loop backing file path\n");
-//                 snprintf(out, len, "/dev/%s", disk->disk_name);
-//             } else if (tmp != out) {
-//                 memmove(out, tmp, strlen(tmp) + 1);
-//             }
-//             pr_info("SNAPSHOT: Loop device key: %s\n", out);
-//             return;
-//         } else {
-//             /* Loop device exists but has no backing file yet */
-//             pr_warn("SNAPSHOT: Loop device %s has no backing file (not set up yet)\n", 
-//                     disk->disk_name);
-//             snprintf(out, len, "/dev/%s", disk->disk_name);
-//             return;
-//         }
-//     }
-// #endif
+    /* If it is already save exit */
+    if (xa_load(&session->saved_blocks, cw->sector_key))
+        goto out_done;
 
-//     /* For non-loop devices or when backing file is unavailable */
-//     pr_info("SNAPSHOT: fallback store_key_from_bdev for device: %s\n", bdev->bd_disk->disk_name);
-//     strscpy(out, bdev->bd_disk->disk_name, len); 
-// }
+    bh = __bread(cw->bdev, cw->blocknr, cw->size);
+    if (!bh) {
+        pr_info("SNAPSHOT: __bread failed blk=%llu size=%u\n",
+                            (unsigned long long)cw->blocknr, cw->size);
+        goto out_done;
+    }
+
+    /* Serialize I/O on files */
+    mutex_lock(&session->dir_mtx);
+
+    /* Append data in blocks.dat */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+    wrc = kernel_write(session->data_file, bh->b_data, cw->size, &session->data_pos);
+#else
+    {
+        mm_segment_t oldfs = get_fs(); set_fs(KERNEL_DS);
+        wrc = vfs_write(session->data_file, bh->b_data, cw->size, &session->data_pos);
+        set_fs(oldfs);
+    }
+#endif
+    if (wrc != cw->size) {
+        pr_info("SNAPSHOT: data append short write (%zd/%u)\n", wrc, cw->size);
+    }
+
+    /* Append record in blocks.map */
+    rec.sector = cw->sector_key;
+    rec.size   = cw->size;
+    rec.offset = session->data_pos - cw->size;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+    wrc = kernel_write(session->map_file, (void *)&rec, sizeof(rec), &session->map_pos);
+#else
+    {
+        mm_segment_t oldfs = get_fs(); set_fs(KERNEL_DS);
+        wrc = vfs_write(session->map_file, (void *)&rec, sizeof(rec), &session->map_pos);
+        set_fs(oldfs);
+    }
+#endif
+    if (wrc != sizeof(rec)) {
+        pr_warn_ratelimited("SNAPSHOT: map append short write (%zd/%zu)\n", wrc, sizeof(rec));
+    }
+
+    mutex_unlock(&session->dir_mtx);
+
+    /* Mark copy-once in saved_blocks */
+    ret = xa_err(xa_store(&session->saved_blocks, cw->sector_key, xa_mk_value(1), GFP_KERNEL));
+    if (ret && ret != -EBUSY) {
+        pr_warn_ratelimited("SNAPSHOT: xa_store(sentinella) err=%d\n", ret);
+    }
+
+out_done:
+    if (bh) brelse(bh);
+    xa_erase(&session->pending_block, cw->sector_key);
+    put_session(session);
+    kfree(cw);
+}
+
+/* called from the write hook to enqueue the COW once per sector_key */
+int enqueue_block_work(snapshot_session *session,
+                        struct block_device *bdev,
+                        sector_t blocknr,
+                        unsigned int size,
+                        sector_t sector_key)
+{
+    struct cow_work *cw;
+    int ret;
+
+    /* Idempotence: if we already saved this key, nothing to do */
+    if (xa_load(&session->saved_blocks, sector_key))
+        return 0;
+
+    /* Reserve a 'pending' slot to avoid queuing duplicates */
+    ret = xa_insert(&session->pending_block, sector_key, xa_mk_value(1), GFP_ATOMIC);
+    if (ret) {
+        if (ret == -EBUSY)
+            return 0; /* already queued/in-flight */
+        if (ret == -ENOMEM)
+            return -ENOMEM;
+    }
+
+    cw = kzalloc(sizeof(*cw), GFP_ATOMIC);
+    if (!cw) {
+        /* best-effort cleanup pending mark */
+        xa_erase(&session->pending_block, sector_key);
+        return -ENOMEM;
+    }
+
+    INIT_WORK(&cw->work, cow_work_handler);
+    cw->bdev = bdev;
+    cw->session = session;
+    cw->blocknr = blocknr;
+    cw->size = size;
+    cw->sector_key = sector_key;
+
+    /* Hold session while work is running */
+    atomic_inc(&session->ref_count);
+
+    if (!queue_work(snapshot_wq, &cw->work)) {
+        xa_erase(&session->pending_block, sector_key);
+        put_session(session);
+        kfree(cw);
+        return -EAGAIN;
+    }
+    return 0;
+}
 
 /**
  * create_session - Create a new snapshot session
@@ -175,6 +242,64 @@ int save_block_to_session(snapshot_session *session, sector_t sector,
     return 0;
 }
 
+
+static int create_files_and_meta_for_session(snapshot_session *session, const char *raw_devname)
+{
+    char *pmap = kmalloc(PATH_MAX, GFP_KERNEL);
+    char *pdat = kmalloc(PATH_MAX, GFP_KERNEL);
+    char *pmeta = kmalloc(PATH_MAX, GFP_KERNEL);
+    int err = 0;
+    loff_t pos = 0;
+    char meta[512];
+    size_t mlen;
+
+    session->map_file = NULL;
+    session->data_file = NULL;
+    session->map_pos = 0;
+    session->data_pos = 0;
+
+    snprintf(pmap,  PATH_MAX, "%s/blocks.map", session->snapshot_dir);
+    snprintf(pdat,  PATH_MAX, "%s/blocks.dat", session->snapshot_dir);
+    snprintf(pmeta, PATH_MAX, "%s/meta.json",  session->snapshot_dir);
+
+    session->map_file = filp_open(pmap, O_CREAT|O_WRONLY|O_TRUNC, 0644);
+    if (IS_ERR(session->map_file)) {
+        err = PTR_ERR(session->map_file);
+        session->map_file = NULL;
+        return err;
+    }
+
+    session->data_file = filp_open(pdat, O_CREAT|O_WRONLY|O_TRUNC, 0644);
+    if (IS_ERR(session->data_file)) {
+        err = PTR_ERR(session->data_file);
+        filp_close(session->map_file, NULL);
+        session->map_file = NULL;
+        return err;
+    }
+
+    /* Scrivi un meta minimale (dev + timestamp) */
+    mlen = scnprintf(meta, sizeof(meta),
+                     "{ \"device\": \"%s\", \"timestamp\": %llu }\n",
+                     raw_devname, session->timestamp);
+
+    {
+        struct file *mf = filp_open(pmeta, O_CREAT|O_WRONLY|O_TRUNC, 0644);
+        if (!IS_ERR(mf)) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+            kernel_write(mf, meta, mlen, &pos);
+#else
+            {
+                mm_segment_t oldfs = get_fs(); set_fs(KERNEL_DS);
+                vfs_write(mf, meta, mlen, &pos);
+                set_fs(oldfs);
+            }
+#endif
+            filp_close(mf, NULL);
+        }
+    }
+
+    return 0;
+}
 /**
  * is_block_saved - Check if a block has been saved in this session
  */
@@ -252,7 +377,11 @@ static int create_snapshot_subdirectory(snapshot_session *session,
         pr_info("SNAPSHOT: Directory created: %s\n", path);
         err = 0;
     }
-    
+    err = create_files_and_meta_for_session(session, raw_devname);
+    if (err) {
+        pr_err("SNAPSHOT: creation/open files/meta failed: %d\n", err);
+        return err;
+    }
     done_path_create(&parent_path, dentry);
     kfree(path);
     return err;

@@ -56,6 +56,12 @@ int register_device(const char *devname);
 int unregister_device(const char *devname);
 
 /**
+ * restore_device - Restore a device
+ * @devname: Name of the device to restore
+ * Return: 0 on success, error code on failure
+ */
+int restore_device(const char *devname);
+/**
  * find_device - Find a registered device by name
  * @devname: Name of the device to find
  * Return: Pointer to the device if found, NULL otherwise
