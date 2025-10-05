@@ -45,24 +45,22 @@ typedef struct {
 
 /**
  * struct snapshot_device - Represents a snapshot device
- * @dev: (major : minor) device number
  * @name: Device name 
+ * @bdev: Associated block device (if mounted)
  * @snapshot_active: Flag indicating if snapshot is active
  * @list: List head for linking devices
  * @rcu: RCU head used for lockless readers
  * @lock: Spinlock to protect access to sessions list
  * @sessions: List of active sessions
- * @bdev: Associated block device (if mounted)
  */
 typedef struct snapshot_device {
-    dev_t dev;
     char name[MAX_DEV_LEN];
+    struct block_device *bdev;
     bool snapshot_active;
     struct list_head list;
     struct rcu_head rcu;
     spinlock_t lock;          
     struct list_head sessions;
-    struct block_device *bdev;
     snapshot_session __rcu *active_session;
 } snapshot_device;
 

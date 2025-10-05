@@ -349,29 +349,32 @@ int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64
  */
 int stop_sessions_for_bdev(snapshot_device *sdev)
 {
+    LIST_HEAD(to_free);
     snapshot_session *session, *tmp;
-    
-    if (!sdev)
+    /* Return if there isn't a device attached*/
+    if (!sdev || !sdev->bdev)
         return -EINVAL;
-    
+
     pr_info("SNAPSHOT: Stopping all sessions for: %s\n", sdev->name);
-    
+
+    /* Detach under spinlock */
     spin_lock(&sdev->lock);
-    rcu_assign_pointer(sdev->active_session, NULL);
-    synchronize_rcu(); 
-    /* Remove and destroy all sessions */
+    RCU_INIT_POINTER(sdev->active_session, NULL);
+
+    /* Move all sessions to a private list so we can free them later */
     list_for_each_entry_safe(session, tmp, &sdev->sessions, list) {
-        list_del(&session->list);
-        spin_unlock(&sdev->lock);
-        
-        destroy_session(session);
-        
-        spin_lock(&sdev->lock);
+        list_move_tail(&session->list, &to_free);
     }
-    
     sdev->bdev = NULL;
     spin_unlock(&sdev->lock);
-    
+
+    synchronize_rcu();
+
+    /* Destroy sessions*/
+    list_for_each_entry_safe(session, tmp, &to_free, list) {
+        list_del_init(&session->list);
+        destroy_session(session);
+    }
     return 0;
 }
 

@@ -15,7 +15,7 @@ int main(int argc, char** argv){
 	//for loop device the devname is the path of the image file
 	char *devname = "/home/aries/Documents/GitHub/block-device-snapshot/image";
 	//this code is retrieved from the usctm module
-	int ret = activate_or_deactivate_snapshot(syscall_num1_activate, devname, passw);
-	printf("sys call %d returned value %d\n",syscall_num1_activate, ret);
+	int ret = activate_or_deactivate_snapshot(syscall_num2_deactivate, devname, passw);
+	printf("sys call %d returned value %d\n",syscall_num2_deactivate, ret);
 
 }
