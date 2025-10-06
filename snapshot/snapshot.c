@@ -14,6 +14,59 @@
 #include "include/snapshot.h"
 #include "../register/include/register.h"
 
+#include <linux/printk.h>
+#include <linux/ratelimit.h>
+#include <linux/bitops.h>
+
+static bool snap_trace = true;             /* master on/off */
+module_param_named(trace, snap_trace, bool, 0644);
+MODULE_PARM_DESC(trace, "Enable verbose snapshot tracing");
+
+static int snap_dump_bytes = 64;           /* hexdump N bytes (0 = off) */
+module_param_named(dump_bytes, snap_dump_bytes, int, 0644);
+MODULE_PARM_DESC(dump_bytes, "Number of bytes to hex dump per block");
+
+static unsigned int snap_log_every = 1;    /* log 1 of every N events */
+module_param_named(log_every, snap_log_every, uint, 0644);
+MODULE_PARM_DESC(log_every, "Log only 1 out of N write events");
+
+static atomic64_t snap_evt_count = ATOMIC_INIT(0);
+
+static void snap_dump_bh(const char *tag, struct buffer_head *bh,
+                         sector_t sector_key, bool is_new)
+{
+    if (!snap_trace) return;
+    if (snap_log_every > 1) {
+        u64 c = atomic64_inc_return(&snap_evt_count);
+        if ((c % snap_log_every) != 0) return;
+    }
+
+    /* buffer_head state bits */
+    bool dirty    = test_bit(BH_Dirty,    &bh->b_state);
+    bool uptodate = test_bit(BH_Uptodate, &bh->b_state);
+    bool mapped   = test_bit(BH_Mapped,   &bh->b_state);
+    bool locked   = test_bit(BH_Lock,     &bh->b_state);
+
+    pr_info("SNAPSHOT:%s dev=%s blk=%llu (%zu bytes, %llu sectors) key=%llu "
+            "state{D=%d,U=%d,M=%d,L=%d} pid=%d comm=%s %s\n",
+            tag,
+            bh->b_bdev && bh->b_bdev->bd_disk ? bh->b_bdev->bd_disk->disk_name : "?",
+            (unsigned long long)bh->b_blocknr,
+            bh->b_size,
+            (unsigned long long)(bh->b_size >> 9),
+            (unsigned long long)sector_key,
+            dirty, uptodate, mapped, locked,
+            current->pid, current->comm,
+            is_new ? "NEW_DATA (about-to-be-written)"
+                   : "OLD_DATA (read-from-disk via __bread)");
+
+    if (snap_dump_bytes > 0 && bh->b_data) {
+        size_t dump = min_t(size_t, bh->b_size, (size_t)snap_dump_bytes);
+        print_hex_dump(KERN_INFO, "SNAPSHOT:bytes ",
+                       DUMP_PREFIX_OFFSET, 16, 1, bh->b_data, dump, true);
+    }
+}
+
 /* Workqueue for handling mount events */
 static struct workqueue_struct *snapshot_wq;
 
@@ -32,6 +85,11 @@ static void cow_work_handler(struct work_struct *w)
     ssize_t wrc;
     int ret;
 
+    pr_info("SNAPSHOT: cow_work start blk=%llu size=%u key=%llu dir=%s\n",
+        (unsigned long long)cw->blocknr, cw->size,
+        (unsigned long long)cw->sector_key,
+        session->snapshot_dir);
+
     /* If it is already save exit */
     if (xa_load(&session->saved_blocks, cw->sector_key))
         goto out_done;
@@ -42,7 +100,7 @@ static void cow_work_handler(struct work_struct *w)
                             (unsigned long long)cw->blocknr, cw->size);
         goto out_done;
     }
-
+    snap_dump_bh("cow_read", bh, cw->sector_key, false);
     /* Serialize I/O on files */
     mutex_lock(&session->dir_mtx);
 
@@ -77,7 +135,11 @@ static void cow_work_handler(struct work_struct *w)
     if (wrc != sizeof(rec)) {
         pr_warn_ratelimited("SNAPSHOT: map append short write (%zd/%zu)\n", wrc, sizeof(rec));
     }
-
+    pr_info("SNAPSHOT: map<= {sector=%llu size=%u offset=%llu}  dir=%s  map_pos=%lld data_pos=%lld\n",
+        (unsigned long long)rec.sector, rec.size,
+        (unsigned long long)rec.offset,
+        session->snapshot_dir,
+        (long long)session->map_pos, (long long)session->data_pos);
     mutex_unlock(&session->dir_mtx);
 
     /* Mark copy-once in saved_blocks */
@@ -89,36 +151,34 @@ static void cow_work_handler(struct work_struct *w)
 out_done:
     if (bh) brelse(bh);
     xa_erase(&session->pending_block, cw->sector_key);
+    pr_info("SNAPSHOT: cow_work end   blk=%llu key=%llu\n",
+        (unsigned long long)cw->blocknr, (unsigned long long)cw->sector_key);
     put_session(session);
     kfree(cw);
 }
 
 /* called from the write hook to enqueue the COW once per sector_key */
+//1 = queued; 0 = pending/saved; 
 int enqueue_block_work(snapshot_session *session,
-                        struct block_device *bdev,
-                        sector_t blocknr,
-                        unsigned int size,
-                        sector_t sector_key)
+    struct block_device *bdev,
+    sector_t blocknr,
+    unsigned int size,
+    sector_t sector_key)
 {
     struct cow_work *cw;
     int ret;
 
-    /* Idempotence: if we already saved this key, nothing to do */
     if (xa_load(&session->saved_blocks, sector_key))
         return 0;
 
-    /* Reserve a 'pending' slot to avoid queuing duplicates */
     ret = xa_insert(&session->pending_block, sector_key, xa_mk_value(1), GFP_ATOMIC);
-    if (ret) {
-        if (ret == -EBUSY)
-            return 0; /* already queued/in-flight */
-        if (ret == -ENOMEM)
-            return -ENOMEM;
-    }
+    if (ret == -EBUSY)
+        return 0;
+    if (ret)
+        return ret;
 
     cw = kzalloc(sizeof(*cw), GFP_ATOMIC);
     if (!cw) {
-        /* best-effort cleanup pending mark */
         xa_erase(&session->pending_block, sector_key);
         return -ENOMEM;
     }
@@ -130,7 +190,6 @@ int enqueue_block_work(snapshot_session *session,
     cw->size = size;
     cw->sector_key = sector_key;
 
-    /* Hold session while work is running */
     atomic_inc(&session->ref_count);
 
     if (!queue_work(snapshot_wq, &cw->work)) {
@@ -139,7 +198,7 @@ int enqueue_block_work(snapshot_session *session,
         kfree(cw);
         return -EAGAIN;
     }
-    return 0;
+return 1;
 }
 
 /**
@@ -511,6 +570,8 @@ int stop_sessions_for_bdev(snapshot_device *sdev)
 
 /**
  * write_dirty_buffer_handler - Kretprobe handler for write_dirty_buffer
+ *     
+ * NB: The write is intercepted here 2 times : block=2 → data block and block=1 → inode block
  * 
  */
 static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
@@ -537,26 +598,26 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
     session = get_active_session_rcu(sdev);
     if (!session) return 0;
     key = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
-    
-    //NB: this saves block=2 → data block and block=1 → inode block
-    ret = xa_insert(&session->pending_block, key, xa_mk_value(1), GFP_ATOMIC);
-    if (ret == -EBUSY) {
-        /* the entry is already saved */
-        put_session(session);
-        pr_info("SNAPSHOT: Block %llu already pending\n", (unsigned long long)key);
-        return 0;
-    }
-    if (ret == -ENOMEM) {
-        pr_warn_ratelimited("SNAPSHOT: Memory allocation failed for pending block %llu\n", (unsigned long long)key);
-        put_session(session);
-        return 0;
-    }
 
-    /* TODO: Add to workqueue to manage the main logic for snapshot */
     pr_info("SNAPSHOT: Adding block dev=%s block=%llu size=%zu\n",
             bh->b_bdev->bd_disk->disk_name,
             (unsigned long long)bh->b_blocknr,
             (size_t)bh->b_size);
+    snap_dump_bh("write_hook", bh, key, true); 
+
+    ret = enqueue_block_work(session, bh->b_bdev, bh->b_blocknr, bh->b_size, key);
+    if (ret && ret != -EBUSY) {
+        pr_info("SNAPSHOT: enqueue COW failed blk=%llu size=%u key=%llu err=%d\n",
+                            (unsigned long long)bh->b_blocknr, bh->b_size,
+                            (unsigned long long)key, ret);
+    } else if (!ret) {
+        pr_info("SNAPSHOT: COW queued blk=%llu size=%zu key=%llu\n",
+                (unsigned long long)bh->b_blocknr, bh->b_size, (unsigned long long)key);
+    } else {
+        pr_info("SNAPSHOT: COW already pending/saved key=%llu\n",
+                 (unsigned long long)key);
+    }
+
     put_session(session);
     return 0;
 
