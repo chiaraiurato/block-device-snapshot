@@ -259,6 +259,12 @@ int init_module(void) {
             return ret;
         }
         printk("%s: register write_dirty_buffer() hook successfully\n", MODNAME);
+        ret = install_read_hook();
+        if (ret < 0) {
+            printk("%s: Error while hooking __bread_gfp()\n", MODNAME);
+            return ret;
+        }
+        printk("%s: register __bread_gfp() hook successfully\n", MODNAME);
         
         /* create workqueue for mounting sdev*/
         snapshot_init();
@@ -275,6 +281,7 @@ void cleanup_module(void) {
         // TODO : refactor to remove all hooks in a single function
         remove_mount_hook();
         remove_write_hook();
+        remove_read_hook();
         unprotect_memory();
         for(int i=0;i<HACKED_ENTRIES;i++){
                 ((unsigned long *)the_syscall_table)[restore[i]] = the_ni_syscall;

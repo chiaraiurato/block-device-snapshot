@@ -71,9 +71,9 @@ static void snap_dump_bh(const char *tag, struct buffer_head *bh,
 static struct workqueue_struct *snapshot_wq;
 
 struct snapshot_rec {
-    u64 sector;   /* chiave in settori (512B) */
+    u64 sector;   /* key (512B) */
     u32 size;     /* bytes */
-    u64 offset;   /* offset dentro blocks.dat */
+    u64 offset;   /* offset inside blocks.dat */
 } __packed;
 
 static void cow_work_handler(struct work_struct *w)
@@ -93,16 +93,16 @@ static void cow_work_handler(struct work_struct *w)
     /* If it is already save exit */
     if (xa_load(&session->saved_blocks, cw->sector_key))
         goto out_done;
-
-    bh = __bread(cw->bdev, cw->blocknr, cw->size);
-    if (!bh) {
-        pr_info("SNAPSHOT: __bread failed blk=%llu size=%u\n",
-                            (unsigned long long)cw->blocknr, cw->size);
-        goto out_done;
-    }
-    snap_dump_bh("cow_read", bh, cw->sector_key, false);
-    /* Serialize I/O on files */
-    mutex_lock(&session->dir_mtx);
+    // We must read the old block before hooking the write
+    // bh = __bread(cw->bdev, cw->blocknr, cw->size);
+    // if (!bh) {
+    //     pr_info("SNAPSHOT: __bread failed blk=%llu size=%u\n",
+    //                         (unsigned long long)cw->blocknr, cw->size);
+    //     goto out_done;
+    // }
+    // snap_dump_bh("cow_read", bh, cw->sector_key, false);
+    // /* Serialize I/O on files */
+    // mutex_lock(&session->dir_mtx);
 
     /* Append data in blocks.dat */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
@@ -605,25 +605,48 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
             (size_t)bh->b_size);
     snap_dump_bh("write_hook", bh, key, true); 
 
-    ret = enqueue_block_work(session, bh->b_bdev, bh->b_blocknr, bh->b_size, key);
-    if (ret && ret != -EBUSY) {
-        pr_info("SNAPSHOT: enqueue COW failed blk=%llu size=%u key=%llu err=%d\n",
-                            (unsigned long long)bh->b_blocknr, bh->b_size,
-                            (unsigned long long)key, ret);
-    } else if (!ret) {
-        pr_info("SNAPSHOT: COW queued blk=%llu size=%zu key=%llu\n",
-                (unsigned long long)bh->b_blocknr, bh->b_size, (unsigned long long)key);
-    } else {
-        pr_info("SNAPSHOT: COW already pending/saved key=%llu\n",
-                 (unsigned long long)key);
-    }
+    // ret = enqueue_block_work(session, bh->b_bdev, bh->b_blocknr, bh->b_size, key);
+    // if (ret && ret != -EBUSY) {
+    //     pr_info("SNAPSHOT: enqueue COW failed blk=%llu size=%u key=%llu err=%d\n",
+    //                         (unsigned long long)bh->b_blocknr, bh->b_size,
+    //                         (unsigned long long)key, ret);
+    // } else if (!ret) {
+    //     pr_info("SNAPSHOT: COW queued blk=%llu size=%zu key=%llu\n",
+    //             (unsigned long long)bh->b_blocknr, bh->b_size, (unsigned long long)key);
+    // } else {
+    //     pr_info("SNAPSHOT: COW already pending/saved key=%llu\n",
+    //              (unsigned long long)key);
+    // }
 
     put_session(session);
     return 0;
 
 }
 
+static int __bread_gfp_handler(struct kretprobe_instance *p, struct pt_regs *regs)
+{
+    struct buffer_head *bh = (struct buffer_head *)regs_return_value(regs);
+    snapshot_device *sdev;
+    snapshot_session *session;
+    sector_t sector_key;
+    int ret;
 
+    if (!bh || IS_ERR(bh) || !bh->b_bdev)
+        return 0;
+    pr_info("SNAPSHOT: Inside hook __sbread()\n");
+    if (!bh){
+        pr_info("SNAPSHOT: bh is NULL\n");
+        return 0;
+    }
+    sector_key = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
+
+    snap_dump_bh("sb_bread_ret", bh, sector_key, false);
+    return 0;
+} 
+/**
+ * Hook for __sbread_gfp to log read operations
+ * NB: sb_bread can't be hooked because it is inlined
+ */
 static struct kprobe write_dirty_buffer_kp = {
     .symbol_name = "write_dirty_buffer",
     .pre_handler = write_dirty_buffer_handler,
@@ -650,6 +673,38 @@ int install_write_hook(void)
 void remove_write_hook(void)
 {
     unregister_kprobe(&write_dirty_buffer_kp);
+}
+
+/* Kretprobe structure for hooking __sbread */
+static struct kretprobe __bread_gfp_kp = {
+    .kp.symbol_name = "__bread_gfp",
+    .handler = __bread_gfp_handler,
+    .maxactive = 1, /* Handle up to 20 concurrent mounts */
+};
+
+/**
+ * install_read_hook - Install the read event hook
+ */
+int install_read_hook(void)
+{
+    int ret;
+    
+    ret = register_kretprobe(&__bread_gfp_kp);
+    if (ret < 0) {
+        pr_err("SNAPSHOT: Failed to register kretprobe on read: %d\n", ret);
+        return ret;
+    }
+    return 0;
+}
+
+/**
+ * remove_read_hook - Remove the read event hook
+ */
+void remove_read_hook(void)
+{
+    unregister_kretprobe(&__bread_gfp_kp);
+    pr_info("SNAPSHOT: Read hook removed (missed %d probes)\n", 
+        __bread_gfp_kp.nmissed);
 }
 
 /**

@@ -144,6 +144,11 @@ int install_write_hook(void);
  * remove_write_hook - Remove the write event hook
  */
 void remove_write_hook(void);
-
+/**
+ * install_read_hook - Install the read event hook
+ * Return: 0 on success, error code on failure
+ */
+int install_read_hook(void);
+void remove_read_hook(void);
 
 #endif
