@@ -4,6 +4,8 @@ the_block-device-snapshot-objs += block-device-snapshot.o lib/scth.o utils/auth.
 MOUNT_PATH = mount
 USER_APP = user/user.out
 USER_SRC = user/user.c
+RESTORE_APP = restore/restore.out
+RESTORE_SRC = restore/restore.c
 SINGLEFILE_FS_DIR = singlefile-FS
 
 all: compile mount compile-user 
@@ -77,6 +79,11 @@ run-user: compile-user
 	@echo "Running user application with sudo..."
 	@sudo $(USER_APP)
 	@echo "User application execution completed"
+
+compile-restore:
+	@echo "Compiling restore application..."
+	@gcc $(RESTORE_SRC) -o $(RESTORE_APP) -Wall -Wextra
+	@echo "Restor application compiled successfully"
 
 clean: unmount clean-compile
 

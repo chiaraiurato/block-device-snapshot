@@ -19,7 +19,8 @@
         "mount.h": "c",
         "singlefilefs.h": "c",
         "major.h": "c",
-        "limits.h": "c"
+        "limits.h": "c",
+        "types.h": "c"
     },
     "C_Cpp.errorSquiggles": "disabled"
 }

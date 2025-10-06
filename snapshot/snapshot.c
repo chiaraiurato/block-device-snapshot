@@ -327,7 +327,7 @@ static int create_snapshot_subdirectory(snapshot_session *session,
     char *path = kmalloc(PATH_MAX, GFP_KERNEL);
     if (!path) return -ENOMEM;
     
-    /* Sanitize device name (extract basename) */
+    /* Sanitize device name (extract the last part of path) */
     base = strrchr(raw_devname, '/');
     base = base ? base + 1 : raw_devname;
     
@@ -346,7 +346,7 @@ static int create_snapshot_subdirectory(snapshot_session *session,
           (basename_only[1] == '.' && basename_only[2] == '\0')))) {
         strscpy(basename_only, "dev", sizeof(basename_only));
     }
-    
+  
     /* Create path: /snapshot/devname_timestamp */
     ktime_get_real_ts64(&ts);
     snprintf(path, PATH_MAX, "/snapshot/%s_%lld",
@@ -386,6 +386,7 @@ static int create_snapshot_subdirectory(snapshot_session *session,
     kfree(path);
     return err;
 }
+
 
 /**
  * mount_work_handler - Workqueue handler for mount events

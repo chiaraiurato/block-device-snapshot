@@ -65,7 +65,7 @@ module_param(the_syscall_table, ulong, 0);
 
 unsigned long the_ni_syscall;
 
-unsigned long new_sys_call_array[] = {0x0,0x0, 0x0}; //please set to sys_activate_snapshot, sys_deactivate_snapshot, sys_restore_snapshot at startup
+unsigned long new_sys_call_array[] = {0x0,0x0}; //please set to sys_activate_snapshot and sys_deactivate_snapshot at startup
 #define HACKED_ENTRIES (int)(sizeof(new_sys_call_array)/sizeof(unsigned long))
 int restore[HACKED_ENTRIES] = {[0 ... (HACKED_ENTRIES-1)] -1};
 
@@ -82,11 +82,11 @@ MODULE_PARM_DESC(the_snapshot_secret, "Password used for authentication");
 
 static int handle_snapshot_operation(const char __user *devname, 
                                      const char __user *passwd,
-                                     int code_op)
+                                     bool activate)
 {
     AUDIT
-    printk("%s: syscall_snapshot called from thread %d\n with operation code %d\n", 
-          MODNAME, current->pid, code_op);
+    printk("%s: sys_%s_snapshot called from thread %d\n", 
+          MODNAME, activate ? "activate" : "deactivate", current->pid);
     
     int ret;
     char *k_devname = NULL;
@@ -146,27 +146,19 @@ static int handle_snapshot_operation(const char __user *devname,
         goto cleanup;
     }
     /* Operation-specific logic */
-    if (code_op == 1) { // activate
+    if (activate) {
         ret = register_device(k_devname);
         if (ret == -EEXIST) {
              printk("%s: Device %s already registered\n", MODNAME, k_devname);
              ret = 0;
          }
         
-    } else if(code_op == 0) { // deactivate
+    } else {
         ret = unregister_device(k_devname);
         if (ret == -ENODEV) {
             printk("%s: Device %s not found\n", MODNAME, k_devname);
             ret = 0;
         }
-    } else if (code_op == 2){ //restore
-
-        ret = restore_device(k_devname);
-        if (ret < 0) {
-            printk("%s: Failed to restore snapshot for device %s: %d\n", 
-                   MODNAME, k_devname, ret);
-        }
-
     }
     
 cleanup:
@@ -182,7 +174,7 @@ __SYSCALL_DEFINEx(2, _activate_snapshot, const char  __user *, devname,const cha
 asmlinkage long sys_activate_snapshot(const char  __user *devname, const char __user *passwd){
 #endif
 
-        return handle_snapshot_operation(devname, passwd, 1);
+        return handle_snapshot_operation(devname, passwd, true);
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
@@ -190,23 +182,12 @@ __SYSCALL_DEFINEx(2, _deactivate_snapshot, const char  __user *, devname,const c
 #else
 asmlinkage long sys_deactivate_snapshot(const char  __user *devname, const char __user *passwd){
 #endif
-        return handle_snapshot_operation(devname, passwd, 0);
+        return handle_snapshot_operation(devname, passwd, false);
 
 }
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
-__SYSCALL_DEFINEx(2, _restore_snapshot, const char  __user *, devname,const char __user *, passwd){
-#else
-asmlinkage long sys_restore_snapshot(const char  __user *devname, const char __user *passwd){
-#endif
-        return handle_snapshot_operation(devname, passwd, 2);
-
-}
-
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
 long sys_activate_snapshot = (unsigned long) __x64_sys_activate_snapshot;       
-long sys_deactivate_snapshot = (unsigned long) __x64_sys_deactivate_snapshot;   
-long sys_restore_snapshot = (unsigned long) __x64_sys_restore_snapshot;    
+long sys_deactivate_snapshot = (unsigned long) __x64_sys_deactivate_snapshot;       
 #else
 #endif
 
@@ -246,7 +227,6 @@ int init_module(void) {
 
         new_sys_call_array[0] = (unsigned long)sys_activate_snapshot;
         new_sys_call_array[1] = (unsigned long)sys_deactivate_snapshot;
-        new_sys_call_array[2] = (unsigned long) sys_restore_snapshot;
 
         ret = get_entries(restore,HACKED_ENTRIES,(unsigned long*)the_syscall_table,&the_ni_syscall);
 
