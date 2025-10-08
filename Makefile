@@ -61,14 +61,17 @@ mount:
 		the_syscall_table=$$SYS_CALL_TABLE \
 		the_snapshot_secret=$$SECR3T_VAL || { echo "ERROR: failed to load snapshot"; exit 1; }
 
+load-fs:
+	sudo insmod $(SINGLEFILE_FS_DIR)/singlefilefs.ko
+	@echo "Insmod singlefilefs module successfully"
 	
 mount-fs:
-	sudo insmod $(SINGLEFILE_FS_DIR)/singlefilefs.ko
 	sudo mount -o loop -t singlefilefs image ./$(MOUNT_PATH)/
-	@echo "Modules mounted successfully"
+	@echo "Singlefile-fs mounted successfully"
 
 unmount-fs:
 	sudo umount $(MOUNT_PATH)/ -f
+	@echo "Singlefile-fs unmounted successfully"
 
 compile-user:
 	@echo "Compiling user application..."
@@ -83,7 +86,7 @@ run-user: compile-user
 compile-restore:
 	@echo "Compiling restore application..."
 	@gcc $(RESTORE_SRC) -o $(RESTORE_APP) -Wall -Wextra
-	@echo "Restor application compiled successfully"
+	@echo "Restore application compiled successfully"
 
 clean: unmount clean-compile
 

@@ -12,6 +12,7 @@
 #include <linux/kprobes.h>
 #include <linux/buffer_head.h>
 #include "include/snapshot.h"
+#include <linux/mnt_idmapping.h>
 #include "../register/include/register.h"
 
 #include <linux/printk.h>
@@ -76,130 +77,14 @@ struct snapshot_rec {
     u64 offset;   /* offset inside blocks.dat */
 } __packed;
 
-static void cow_work_handler(struct work_struct *w)
-{
-    struct cow_work *cw = container_of(w, struct cow_work, work);
-    snapshot_session *session = cw->session;
-    struct buffer_head *bh = NULL;
-    struct snapshot_rec rec;
-    ssize_t wrc;
-    int ret;
+struct cow_mem_work {
+    struct work_struct work;
+    snapshot_session *session;
+    sector_t sector_key;     
+    unsigned int size;       
+    void *data;               
+};
 
-    pr_info("SNAPSHOT: cow_work start blk=%llu size=%u key=%llu dir=%s\n",
-        (unsigned long long)cw->blocknr, cw->size,
-        (unsigned long long)cw->sector_key,
-        session->snapshot_dir);
-
-    /* If it is already save exit */
-    if (xa_load(&session->saved_blocks, cw->sector_key))
-        goto out_done;
-    // We must read the old block before hooking the write
-    // bh = __bread(cw->bdev, cw->blocknr, cw->size);
-    // if (!bh) {
-    //     pr_info("SNAPSHOT: __bread failed blk=%llu size=%u\n",
-    //                         (unsigned long long)cw->blocknr, cw->size);
-    //     goto out_done;
-    // }
-    // snap_dump_bh("cow_read", bh, cw->sector_key, false);
-    // /* Serialize I/O on files */
-    // mutex_lock(&session->dir_mtx);
-
-    /* Append data in blocks.dat */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
-    wrc = kernel_write(session->data_file, bh->b_data, cw->size, &session->data_pos);
-#else
-    {
-        mm_segment_t oldfs = get_fs(); set_fs(KERNEL_DS);
-        wrc = vfs_write(session->data_file, bh->b_data, cw->size, &session->data_pos);
-        set_fs(oldfs);
-    }
-#endif
-    if (wrc != cw->size) {
-        pr_info("SNAPSHOT: data append short write (%zd/%u)\n", wrc, cw->size);
-    }
-
-    /* Append record in blocks.map */
-    rec.sector = cw->sector_key;
-    rec.size   = cw->size;
-    rec.offset = session->data_pos - cw->size;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
-    wrc = kernel_write(session->map_file, (void *)&rec, sizeof(rec), &session->map_pos);
-#else
-    {
-        mm_segment_t oldfs = get_fs(); set_fs(KERNEL_DS);
-        wrc = vfs_write(session->map_file, (void *)&rec, sizeof(rec), &session->map_pos);
-        set_fs(oldfs);
-    }
-#endif
-    if (wrc != sizeof(rec)) {
-        pr_warn_ratelimited("SNAPSHOT: map append short write (%zd/%zu)\n", wrc, sizeof(rec));
-    }
-    pr_info("SNAPSHOT: map<= {sector=%llu size=%u offset=%llu}  dir=%s  map_pos=%lld data_pos=%lld\n",
-        (unsigned long long)rec.sector, rec.size,
-        (unsigned long long)rec.offset,
-        session->snapshot_dir,
-        (long long)session->map_pos, (long long)session->data_pos);
-    mutex_unlock(&session->dir_mtx);
-
-    /* Mark copy-once in saved_blocks */
-    ret = xa_err(xa_store(&session->saved_blocks, cw->sector_key, xa_mk_value(1), GFP_KERNEL));
-    if (ret && ret != -EBUSY) {
-        pr_warn_ratelimited("SNAPSHOT: xa_store(sentinella) err=%d\n", ret);
-    }
-
-out_done:
-    if (bh) brelse(bh);
-    xa_erase(&session->pending_block, cw->sector_key);
-    pr_info("SNAPSHOT: cow_work end   blk=%llu key=%llu\n",
-        (unsigned long long)cw->blocknr, (unsigned long long)cw->sector_key);
-    put_session(session);
-    kfree(cw);
-}
-
-/* called from the write hook to enqueue the COW once per sector_key */
-//1 = queued; 0 = pending/saved; 
-int enqueue_block_work(snapshot_session *session,
-    struct block_device *bdev,
-    sector_t blocknr,
-    unsigned int size,
-    sector_t sector_key)
-{
-    struct cow_work *cw;
-    int ret;
-
-    if (xa_load(&session->saved_blocks, sector_key))
-        return 0;
-
-    ret = xa_insert(&session->pending_block, sector_key, xa_mk_value(1), GFP_ATOMIC);
-    if (ret == -EBUSY)
-        return 0;
-    if (ret)
-        return ret;
-
-    cw = kzalloc(sizeof(*cw), GFP_ATOMIC);
-    if (!cw) {
-        xa_erase(&session->pending_block, sector_key);
-        return -ENOMEM;
-    }
-
-    INIT_WORK(&cw->work, cow_work_handler);
-    cw->bdev = bdev;
-    cw->session = session;
-    cw->blocknr = blocknr;
-    cw->size = size;
-    cw->sector_key = sector_key;
-
-    atomic_inc(&session->ref_count);
-
-    if (!queue_work(snapshot_wq, &cw->work)) {
-        xa_erase(&session->pending_block, sector_key);
-        put_session(session);
-        kfree(cw);
-        return -EAGAIN;
-    }
-return 1;
-}
 
 /**
  * create_session - Create a new snapshot session
@@ -221,6 +106,7 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp)
     xa_init(&session->pending_block);
     INIT_LIST_HEAD(&session->list);
     atomic_set(&session->ref_count, 1);
+    atomic64_set(&session->blocks_count, 0);
     
     pr_info("SNAPSHOT: Created session with timestamp %llu\n", timestamp);
     return session;
@@ -231,20 +117,28 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp)
  */
 void destroy_session(snapshot_session *session)
 {
-    struct block_data *bdata;
     unsigned long index;
+    void *entry;
     
     if (!session)
         return;
     
-    pr_info("SNAPSHOT: Destroying session %llu\n", session->timestamp);
+    pr_info("SNAPSHOT: Destroying session %llu\n", 
+            session->timestamp);
     
-    /* Free all saved blocks */
-    xa_for_each(&session->saved_blocks, index, bdata) {
-        if (bdata) {
-            kfree(bdata->data);
-            kfree(bdata);
-        }
+    /* Close files if still open */
+    if (session->data_file) {
+        filp_close(session->data_file, NULL);
+        session->data_file = NULL;
+    }
+    if (session->map_file) {
+        filp_close(session->map_file, NULL);
+        session->map_file = NULL;
+    }
+    
+    /* Free XArrays (using sentinel values, nothing to free) */
+    xa_for_each(&session->saved_blocks, index, entry) {
+        /* Sentinel values don't need freeing */
     }
     
     xa_destroy(&session->saved_blocks);
@@ -253,119 +147,122 @@ void destroy_session(snapshot_session *session)
     kfree(session);
 }
 
+
 /**
- * save_block_to_session - Save a block's original content
- * 
- * This is called BEFORE a write operation to preserve the original data
+ * update_metadata_file - Update meta.json with final statistics
  */
-int save_block_to_session(snapshot_session *session, sector_t sector,
-                          const void *data, size_t size)
+static int update_metadata_file(snapshot_session *session, const char *raw_devname)
 {
-    struct block_data *bdata;
-    int ret;
-    
-    /* Check if block is already saved (copy-on-write semantics) */
-    if (xa_load(&session->saved_blocks, sector)) {
-        return 0; /* Already saved, nothing to do */
-    }
-    
-    /* Allocate block data structure */
-    bdata = kzalloc(sizeof(*bdata), GFP_KERNEL);
-    if (!bdata)
+    char *pmeta = kmalloc(PATH_MAX, GFP_KERNEL);
+    char meta[1024];
+    size_t mlen;
+    struct file *mf;
+    loff_t pos = 0;
+    //TODO: find a way to retrieve the filesystem type
+    const char *fs_type = "singlefile-fs";
+    int ret = 0;
+
+    if (!pmeta)
         return -ENOMEM;
-    
-    /* Allocate and copy block content */
-    bdata->data = kmalloc(size, GFP_KERNEL);
-    if (!bdata->data) {
-        kfree(bdata);
-        return -ENOMEM;
+
+    snprintf(pmeta, PATH_MAX, "%s/meta.json", session->snapshot_dir);
+
+
+    /* Generate JSON metadata */
+    mlen = scnprintf(meta, sizeof(meta),
+                     "{\n"
+                     "  \"device\": \"%s\",\n"
+                     "  \"timestamp\": %llu,\n"
+                     "  \"block_size\": %u,\n"
+                     "  \"fs_type\": \"%s\",\n"
+                     "  \"total_blocks_saved\": %lld,\n"
+                     "  \"snapshot_type\": \"COW\"\n"
+                     "}\n",
+                     raw_devname,
+                     session->timestamp,
+                     DEFAULT_BLOCK_SIZE,
+                     fs_type,
+                     atomic64_read(&session->blocks_count));
+
+    mf = filp_open(pmeta, O_CREAT|O_WRONLY|O_TRUNC, 0644);
+    if (IS_ERR(mf)) {
+        ret = PTR_ERR(mf);
+        pr_err("SNAPSHOT: Failed to create meta.json: %d\n", ret);
+        goto out;
     }
-    
-    memcpy(bdata->data, data, size);
-    bdata->sector = sector;
-    bdata->size = size;
-    
-    /* Store in XArray */
-    ret = xa_err(xa_store(&session->saved_blocks, sector, bdata, GFP_KERNEL));
-    if (ret) {
-        kfree(bdata->data);
-        kfree(bdata);
-        pr_err("SNAPSHOT: Failed to store block %llu: %d\n", 
-               (unsigned long long)sector, ret);
-        return ret;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+    kernel_write(mf, meta, mlen, &pos);
+#else
+    {
+        mm_segment_t oldfs = get_fs();
+        set_fs(KERNEL_DS);
+        vfs_write(mf, meta, mlen, &pos);
+        set_fs(oldfs);
     }
-    
-    pr_debug("SNAPSHOT: Saved block %llu (size: %zu) for session %llu\n",
-             (unsigned long long)sector, size, session->timestamp);
-    
-    return 0;
+#endif
+
+    filp_close(mf, NULL);
+    pr_info("SNAPSHOT: Updated %s\n", pmeta);
+
+out:
+    kfree(pmeta);
+    return ret;
 }
 
-
+/**
+ * create_files_and_meta_for_session - Create snapshot files
+ */
 static int create_files_and_meta_for_session(snapshot_session *session, const char *raw_devname)
 {
     char *pmap = kmalloc(PATH_MAX, GFP_KERNEL);
     char *pdat = kmalloc(PATH_MAX, GFP_KERNEL);
-    char *pmeta = kmalloc(PATH_MAX, GFP_KERNEL);
     int err = 0;
-    loff_t pos = 0;
-    char meta[512];
-    size_t mlen;
+
+    if (!pmap || !pdat) {
+        err = -ENOMEM;
+        goto cleanup;
+    }
 
     session->map_file = NULL;
     session->data_file = NULL;
     session->map_pos = 0;
     session->data_pos = 0;
 
-    snprintf(pmap,  PATH_MAX, "%s/blocks.map", session->snapshot_dir);
-    snprintf(pdat,  PATH_MAX, "%s/blocks.dat", session->snapshot_dir);
-    snprintf(pmeta, PATH_MAX, "%s/meta.json",  session->snapshot_dir);
+    snprintf(pmap, PATH_MAX, "%s/blocks.map", session->snapshot_dir);
+    snprintf(pdat, PATH_MAX, "%s/blocks.dat", session->snapshot_dir);
 
+    /* Create blocks.map */
     session->map_file = filp_open(pmap, O_CREAT|O_WRONLY|O_TRUNC, 0644);
     if (IS_ERR(session->map_file)) {
         err = PTR_ERR(session->map_file);
         session->map_file = NULL;
-        return err;
+        pr_err("SNAPSHOT: Failed to create blocks.map: %d\n", err);
+        goto cleanup;
     }
 
+    /* Create blocks.dat */
     session->data_file = filp_open(pdat, O_CREAT|O_WRONLY|O_TRUNC, 0644);
     if (IS_ERR(session->data_file)) {
         err = PTR_ERR(session->data_file);
         filp_close(session->map_file, NULL);
         session->map_file = NULL;
-        return err;
+        session->data_file = NULL;
+        pr_err("SNAPSHOT: Failed to create blocks.dat: %d\n", err);
+        goto cleanup;
     }
 
-    /* Scrivi un meta minimale (dev + timestamp) */
-    mlen = scnprintf(meta, sizeof(meta),
-                     "{ \"device\": \"%s\", \"timestamp\": %llu }\n",
-                     raw_devname, session->timestamp);
+    /* Create initial metadata */
+    update_metadata_file(session, raw_devname);
 
-    {
-        struct file *mf = filp_open(pmeta, O_CREAT|O_WRONLY|O_TRUNC, 0644);
-        if (!IS_ERR(mf)) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
-            kernel_write(mf, meta, mlen, &pos);
-#else
-            {
-                mm_segment_t oldfs = get_fs(); set_fs(KERNEL_DS);
-                vfs_write(mf, meta, mlen, &pos);
-                set_fs(oldfs);
-            }
-#endif
-            filp_close(mf, NULL);
-        }
-    }
+    pr_info("SNAPSHOT: Created snapshot files in %s\n", session->snapshot_dir);
 
-    return 0;
+cleanup:
+    kfree(pmap);
+    kfree(pdat);
+    return err;
 }
-/**
- * is_block_saved - Check if a block has been saved in this session
- */
-bool is_block_saved(snapshot_session *session, sector_t sector)
-{
-    return xa_load(&session->saved_blocks, sector) != NULL;
-}
+
 
 /**
  * create_snapshot_subdirectory - Create timestamped directory for session
@@ -603,7 +500,6 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
             bh->b_bdev->bd_disk->disk_name,
             (unsigned long long)bh->b_blocknr,
             (size_t)bh->b_size);
-    snap_dump_bh("write_hook", bh, key, true); 
 
     // ret = enqueue_block_work(session, bh->b_bdev, bh->b_blocknr, bh->b_size, key);
     // if (ret && ret != -EBUSY) {
@@ -623,26 +519,197 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
 
 }
 
-static int __bread_gfp_handler(struct kretprobe_instance *p, struct pt_regs *regs)
+static void cow_mem_worker(struct work_struct *w)
 {
-    struct buffer_head *bh = (struct buffer_head *)regs_return_value(regs);
-    snapshot_device *sdev;
-    snapshot_session *session;
-    sector_t sector_key;
+    struct cow_mem_work *mw = container_of(w, struct cow_mem_work, work);
+    snapshot_session *session = mw->session;
+    struct snapshot_rec rec;
+    ssize_t wrc;
+
+    if (!session->data_file || !session->map_file) {
+        pr_warn_ratelimited("SNAPSHOT: no files open, drop key=%llu\n",
+                            (unsigned long long)mw->sector_key);
+        goto out;
+    }
+
+    mutex_lock(&session->dir_mtx);
+
+    /* Write original block data to blocks.dat */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+    wrc = kernel_write(session->data_file, mw->data, mw->size, &session->data_pos);
+#else
+    { 
+        mm_segment_t oldfs = get_fs(); 
+        set_fs(KERNEL_DS);
+        wrc = vfs_write(session->data_file, mw->data, mw->size, &session->data_pos);
+        set_fs(oldfs); 
+    }
+#endif
+
+    if (wrc != mw->size) {
+        pr_warn_ratelimited("SNAPSHOT: data write incomplete (%zd/%u)\n", wrc, mw->size);
+    }
+
+    /* Write record to blocks.map */
+    rec.sector = mw->sector_key;
+    rec.size   = mw->size;
+    rec.offset = session->data_pos - mw->size;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+    wrc = kernel_write(session->map_file, (void *)&rec, sizeof(rec), &session->map_pos);
+#else
+    { 
+        mm_segment_t oldfs = get_fs(); 
+        set_fs(KERNEL_DS);
+        wrc = vfs_write(session->map_file, (void *)&rec, sizeof(rec), &session->map_pos);
+        set_fs(oldfs); 
+    }
+#endif
+
+    if (wrc != sizeof(rec)) {
+        pr_warn_ratelimited("SNAPSHOT: map write incomplete (%zd/%zu)\n", wrc, sizeof(rec));
+    }
+
+    /* Update block counter */
+    atomic64_inc(&session->blocks_count);
+
+    pr_info("SNAPSHOT: COW saved sector=%llu size=%u offset=%llu (total_blocks=%lld)\n",
+            (unsigned long long)rec.sector, rec.size,
+            (unsigned long long)rec.offset,
+            atomic64_read(&session->blocks_count));
+
+    mutex_unlock(&session->dir_mtx);
+
+    /* Mark as saved (use sentinel value 1) */
+    xa_store(&session->saved_blocks, mw->sector_key, xa_mk_value(1), GFP_KERNEL);
+
+out:
+    xa_erase(&session->pending_block, mw->sector_key);
+    put_session(session);
+    kfree(mw->data);
+    kfree(mw);
+}
+
+static int enqueue_cow_mem(snapshot_session *session,
+                           sector_t sector_key,
+                           const void *src,
+                           unsigned int size)
+{
+    struct cow_mem_work *mw;
+    void *copy;
     int ret;
 
-    if (!bh || IS_ERR(bh) || !bh->b_bdev)
+    /* Check if already saved (copy-once semantic) */
+    if (xa_load(&session->saved_blocks, sector_key))
         return 0;
-    pr_info("SNAPSHOT: Inside hook __sbread()\n");
-    if (!bh){
-        pr_info("SNAPSHOT: bh is NULL\n");
+
+    /* Try to mark as pending (atomic insert) */
+    ret = xa_insert(&session->pending_block, sector_key, xa_mk_value(1), GFP_ATOMIC);
+    if (ret == -EBUSY) {
+        /* Already being processed by another thread */
         return 0;
     }
-    sector_key = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
+    if (ret) {
+        pr_err_ratelimited("SNAPSHOT: xa_insert failed: %d\n", ret);
+        return ret;
+    }
 
-    snap_dump_bh("sb_bread_ret", bh, sector_key, false);
+    /* Allocate memory copy of original data */
+    copy = kmemdup(src, size, GFP_ATOMIC);
+    if (!copy) {
+        xa_erase(&session->pending_block, sector_key);
+        return -ENOMEM;
+    }
+
+    /* Allocate work structure */
+    mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
+    if (!mw) {
+        kfree(copy);
+        xa_erase(&session->pending_block, sector_key);
+        return -ENOMEM;
+    }
+
+    INIT_WORK(&mw->work, cow_mem_worker);
+    mw->session    = session;
+    mw->sector_key = sector_key;
+    mw->size       = size;
+    mw->data       = copy;
+
+    /* Increment session refcount */
+    atomic_inc(&session->ref_count);
+
+    /* Queue work */
+    if (!queue_work(snapshot_wq, &mw->work)) {
+        xa_erase(&session->pending_block, sector_key);
+        put_session(session);
+        kfree(copy);
+        kfree(mw);
+        return -EAGAIN;
+    }
+
+    return 1;  /* Queued successfully */
+}
+
+struct bread_ctx { struct block_device *bdev; sector_t block; unsigned int size; };
+
+static int bread_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
+#if defined(CONFIG_X86_64)
+    struct bread_ctx *c =  (struct bread_ctx *)ri->data;
+    c->bdev  = (struct block_device *)regs->di;
+    c->block = (sector_t)regs->si;
+    c->size  = (unsigned int)regs->dx;
+#endif
     return 0;
-} 
+}
+
+/**
+ * __bread_gfp_handler - Main COW hook
+ * 
+ * Intercepts block reads and saves original content BEFORE any write occurs
+ */
+static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct bread_ctx *c = (struct bread_ctx *)(ri->data);
+    struct buffer_head *bh = (struct buffer_head *)regs_return_value(regs);
+    snapshot_device *sdev;
+    snapshot_session *ses;
+    sector_t key;
+    int r;
+
+    if (!bh || IS_ERR(bh) || !c->bdev)
+        return 0;
+
+    /* Find registered device for this bdev */
+    sdev = find_device_for_bdev(c->bdev);
+    if (!sdev || !READ_ONCE(sdev->snapshot_active) || READ_ONCE(sdev->bdev) != c->bdev)
+        return 0;
+
+    /* Get active session */
+    ses = get_active_session_rcu(sdev);
+    if (!ses)
+        return 0;
+
+    /* Calculate sector key (512B units) */
+    key = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
+
+    snap_dump_bh("COW_CAPTURE", bh, key, false);
+
+    /* Check if NOT already saved or pending */
+    if (!xa_load(&ses->saved_blocks, key) && !xa_load(&ses->pending_block, key)) {
+        r = enqueue_cow_mem(ses, key, bh->b_data, bh->b_size);
+        if (r > 0) {
+            pr_info("SNAPSHOT: COW queued blk=%llu size=%zu key=%llu\n",
+                    (unsigned long long)bh->b_blocknr, 
+                    (size_t)bh->b_size, 
+                    (unsigned long long)key);
+        } else if (r < 0) {
+            pr_warn_ratelimited("SNAPSHOT: COW enqueue failed: %d\n", r);
+        }
+    }
+
+    put_session(ses);
+    return 0;
+}
 /**
  * Hook for __sbread_gfp to log read operations
  * NB: sb_bread can't be hooked because it is inlined
@@ -678,8 +745,10 @@ void remove_write_hook(void)
 /* Kretprobe structure for hooking __sbread */
 static struct kretprobe __bread_gfp_kp = {
     .kp.symbol_name = "__bread_gfp",
+    .entry_handler  = bread_entry,
     .handler = __bread_gfp_handler,
-    .maxactive = 1, /* Handle up to 20 concurrent mounts */
+    .data_size      = sizeof(struct bread_ctx),
+    .maxactive = 64, 
 };
 
 /**

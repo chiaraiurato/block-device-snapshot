@@ -31,6 +31,7 @@ struct block_data {
  * @dir_mtx: Mutex to protect snapshot_dir creation
  * @saved_blocks: XArray of saved blocks (key: sector_t, value: block data)
  * @pending_block: XArray of blocks pending to be copied
+ * @blocks_count: Count of blocks saved in this session
  * @list: List head for linking sessions
  * @ref_count: Reference counter for safe cleanup
  */
@@ -41,6 +42,7 @@ typedef struct {
     struct mutex dir_mtx;
     struct xarray saved_blocks;
     struct xarray pending_block; 
+    atomic64_t blocks_count;
     struct list_head list;
     atomic_t ref_count;
     struct file *map_file;        
@@ -100,10 +102,6 @@ int stop_sessions_for_bdev(snapshot_device *sdev);
 snapshot_session *create_session(snapshot_device *sdev, u64 timestamp);
 void destroy_session(snapshot_session *session);
 
-/* Block tracking */
-int save_block_to_session(snapshot_session *session, sector_t sector, 
-                          const void *data, size_t size);
-bool is_block_saved(snapshot_session *session, sector_t sector);
 
 int queue_cow_for_block(snapshot_session *session,
     struct block_device *bdev,
@@ -111,8 +109,6 @@ int queue_cow_for_block(snapshot_session *session,
     unsigned int size,
     sector_t sector_key);
 
-/* Run restore (device unmounted): write saved blocks back */
-int restore_snapshot_for_devname(const char *devname);
 
 static inline snapshot_session *get_active_session_rcu(snapshot_device *sdev)
 {
