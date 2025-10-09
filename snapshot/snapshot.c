@@ -469,62 +469,6 @@ int stop_sessions_for_bdev(snapshot_device *sdev)
     }
     return 0;
 }
-
-
-/**
- * write_dirty_buffer_handler - Kretprobe handler for write_dirty_buffer
- *     
- * NB: The write is intercepted here 2 times : block=2 → data block and block=1 → inode block
- * 
- */
-static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
-{
-    struct buffer_head *bh = (struct buffer_head *)regs->di;
-    snapshot_device *sdev;
-    snapshot_session *session;
-    sector_t key;
-    int ret;
-    pr_info("SNAPSHOT: Inside hook write_dirty_buffer\n");
-    if (!bh){
-        pr_info("SNAPSHOT: bh is NULL\n");
-        return 0;
-    } 
-
-    /* Search if the write is coming for the device mounted before*/
-    sdev = find_device_for_bdev(bh->b_bdev);
-    if (!sdev || !READ_ONCE(sdev->snapshot_active) ||
-        READ_ONCE(sdev->bdev) != bh->b_bdev){
-        pr_info("SNAPSHOT: No active snapshot for device %s\n", bh->b_bdev->bd_disk->disk_name);
-        return 0;
-    }
-    
-    session = get_active_session_rcu(sdev);
-    if (!session) return 0;
-    key = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
-
-    pr_info("SNAPSHOT: Adding block dev=%s block=%llu size=%zu\n",
-            bh->b_bdev->bd_disk->disk_name,
-            (unsigned long long)bh->b_blocknr,
-            (size_t)bh->b_size);
-
-    // ret = enqueue_block_work(session, bh->b_bdev, bh->b_blocknr, bh->b_size, key);
-    // if (ret && ret != -EBUSY) {
-    //     pr_info("SNAPSHOT: enqueue COW failed blk=%llu size=%u key=%llu err=%d\n",
-    //                         (unsigned long long)bh->b_blocknr, bh->b_size,
-    //                         (unsigned long long)key, ret);
-    // } else if (!ret) {
-    //     pr_info("SNAPSHOT: COW queued blk=%llu size=%zu key=%llu\n",
-    //             (unsigned long long)bh->b_blocknr, bh->b_size, (unsigned long long)key);
-    // } else {
-    //     pr_info("SNAPSHOT: COW already pending/saved key=%llu\n",
-    //              (unsigned long long)key);
-    // }
-
-    put_session(session);
-    return 0;
-
-}
-
 static void cow_mem_worker(struct work_struct *w)
 {
     struct cow_mem_work *mw = container_of(w, struct cow_mem_work, work);
@@ -539,7 +483,6 @@ static void cow_mem_worker(struct work_struct *w)
     }
 
     mutex_lock(&session->dir_mtx);
-
     /* Write original block data to blocks.dat */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
     wrc = kernel_write(session->data_file, mw->data, mw->size, &session->data_pos);
@@ -551,7 +494,7 @@ static void cow_mem_worker(struct work_struct *w)
         set_fs(oldfs); 
     }
 #endif
-
+    pr_info("SNAPSHOT: I'm writing block data");
     if (wrc != mw->size) {
         pr_warn_ratelimited("SNAPSHOT: data write incomplete (%zd/%u)\n", wrc, mw->size);
     }
@@ -586,7 +529,7 @@ static void cow_mem_worker(struct work_struct *w)
 
     mutex_unlock(&session->dir_mtx);
 
-    /* Mark as saved (use sentinel value 1) */
+    /* Mark as saved */
     xa_store(&session->saved_blocks, mw->sector_key, xa_mk_value(1), GFP_KERNEL);
 
 out:
@@ -605,9 +548,7 @@ static int enqueue_cow_mem(snapshot_session *session,
     void *copy;
     int ret;
 
-    /* Check if already saved (copy-once semantic) */
-    if (xa_load(&session->saved_blocks, sector_key))
-        return 0;
+    /* Here we assume block is not saved, already checked in the caller */
 
     /* Try to mark as pending (atomic insert) */
     ret = xa_insert(&session->pending_block, sector_key, xa_mk_value(1), GFP_ATOMIC);
@@ -656,6 +597,80 @@ static int enqueue_cow_mem(snapshot_session *session,
     return 1;  /* Queued successfully */
 }
 
+/**
+ * write_dirty_buffer_handler - Kretprobe handler for write_dirty_buffer
+ *     
+ * NB: The write is intercepted here 2 times : block=2 → data block and block=1 → inode block
+ * 
+ */
+static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    struct buffer_head *bh = (struct buffer_head *)regs->di;
+    snapshot_device *sdev;
+    snapshot_session *ses;
+    sector_t key;
+    //void *orig_data;
+    int ret;
+
+    if (!bh || !bh->b_bdev)
+        return 0;
+
+    /* Trova il device registrato */
+    sdev = find_device_for_bdev(bh->b_bdev);
+    if (!sdev || !READ_ONCE(sdev->snapshot_active) ||
+        READ_ONCE(sdev->bdev) != bh->b_bdev)
+        return 0;
+
+    ses = get_active_session_rcu(sdev);
+    if (!ses)
+        return 0;
+
+    key = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
+
+    /* Skip if already saved */
+    if (xa_load(&ses->saved_blocks, key)) {
+        pr_info("SNAPSHOT: Block already saved key=%llu\n", 
+                (unsigned long long)key);
+        put_session(ses);
+        return 0;
+    }
+
+    snap_dump_bh("WRITE_CONFIRMED", bh, key, true);
+
+    void *entry = xa_load(&ses->pending_block, key);
+    if (!entry) {
+        /* Write without caching */
+        pr_warn_ratelimited("SNAPSHOT: Write without caching blk=%llu key=%llu\n",
+                            (unsigned long long)bh->b_blocknr, (unsigned long long)key);
+        put_session(ses);
+        return 0;
+    }
+    if (xa_is_value(entry)) {
+        pr_info("SNAPSHOT: COW already pending key=%llu\n", (unsigned long long)key);
+        put_session(ses);
+        return 0;
+    }
+
+    void *old_data = xa_erase(&ses->pending_block, key);
+    if (old_data && !xa_is_value(old_data)) {
+        /* Persist block on disk*/
+        int ret = enqueue_cow_mem(ses, key, old_data, bh->b_size);
+        kfree(old_data);
+
+        if (ret > 0) {
+            pr_info("SNAPSHOT: COW confirmed and queued blk=%llu key=%llu\n",
+                    (unsigned long long)bh->b_blocknr, (unsigned long long)key);
+        } else if (ret && ret != -EBUSY) {
+            pr_warn_ratelimited("SNAPSHOT: COW enqueue failed key=%llu err=%d\n",
+                                (unsigned long long)key, ret);
+        }
+    }
+    put_session(ses);
+    return 0;
+}
+
+
+
 struct bread_ctx { struct block_device *bdev; sector_t block; unsigned int size; };
 
 static int bread_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
@@ -680,7 +695,6 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     snapshot_device *sdev;
     snapshot_session *ses;
     sector_t key;
-    int r;
 
     if (!bh || IS_ERR(bh) || !c->bdev)
         return 0;
@@ -700,22 +714,32 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
 
     snap_dump_bh("COW_CAPTURE", bh, key, false);
 
-    /* Check if NOT already saved or pending */
-    if (!xa_load(&ses->saved_blocks, key) && !xa_load(&ses->pending_block, key)) {
-        r = enqueue_cow_mem(ses, key, bh->b_data, bh->b_size);
-        if (r > 0) {
-            pr_info("SNAPSHOT: COW queued blk=%llu size=%zu key=%llu\n",
-                    (unsigned long long)bh->b_blocknr, 
-                    (size_t)bh->b_size, 
-                    (unsigned long long)key);
-        } else if (r < 0) {
-            pr_warn_ratelimited("SNAPSHOT: COW enqueue failed: %d\n", r);
-        }
+    if (xa_load(&ses->saved_blocks, key) || xa_load(&ses->pending_block, key)) {
+        put_session(ses);
+        return 0;
+    }
+    snap_dump_bh("COW_CAPTURE", bh, key, false);
+
+    /* Copy old data */
+    void *copy = kmemdup(bh->b_data, bh->b_size, GFP_ATOMIC);
+    if (!copy) {
+        put_session(ses);
+        return 0;
     }
 
+    /* Only the first thread can do the inser the other do kfree */
+    if (xa_insert(&ses->pending_block, key, copy, GFP_ATOMIC)) {
+        kfree(copy);
+    } else {
+        pr_info("SNAPSHOT: Block cached blk=%llu size=%zu key=%llu\n",
+                (unsigned long long)bh->b_blocknr,
+                (size_t)bh->b_size,
+                (unsigned long long)key);
+    }
     put_session(ses);
     return 0;
 }
+
 
 
 static int kill_block_super_entry(struct kprobe *p, struct pt_regs *regs)
