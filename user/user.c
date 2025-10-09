@@ -51,6 +51,6 @@ int main(int argc, char **argv) {
         return EXIT_FAILURE;
     }
 
-    printf("Run command '%s': syscall %ld returned %ld\n", cmd, nr, ret);
+    printf("Run sycall_%s  with return code %ld\n", cmd, ret);
     return EXIT_SUCCESS;
 }

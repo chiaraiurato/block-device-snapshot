@@ -362,41 +362,46 @@ static void mount_work_handler(struct work_struct *work) {
         pr_err("SNAPSHOT: No device in mount_work\n");
         goto cleanup;
     }
+    if (mw->action == SNAP_WORK_START) {
 
-    /* Check if snapshot is still active */
-    if (!sdev->snapshot_active) {
-        pr_info("SNAPSHOT: Snapshot no longer active for: %s\n", sdev->name);
-        goto cleanup;
+        /* Check if snapshot is still active */
+        if (!sdev->snapshot_active) {
+            pr_info("SNAPSHOT: Snapshot no longer active for: %s\n", sdev->name);
+            goto cleanup;
+        }
+
+        /* Create new session */
+        timestamp = ktime_get_real_ns();
+        session = create_session(sdev, timestamp);
+        if (!session) {
+            pr_err("SNAPSHOT: Failed to create session for: %s\n", sdev->name);
+            goto cleanup;
+        }
+
+        /* Create snapshot subdirectory - use the device name from sdev */
+        ret = create_snapshot_subdirectory(session, sdev->name);
+        if (ret) {
+            pr_err("SNAPSHOT: Failed to create directory: %d\n", ret);
+            destroy_session(session);
+            goto cleanup;
+        }
+
+        /* Add session to device */
+        spin_lock(&sdev->lock);
+        list_add_tail(&session->list, &sdev->sessions);
+        spin_unlock(&sdev->lock);
+
+        /*Assign active session for device*/
+        rcu_assign_pointer(sdev->active_session, session); 
+
+        pr_info("SNAPSHOT: Session %llu started for device: %s\n", timestamp, sdev->name);
+
+    } else { 
+        pr_info("SNAPSHOT: Unmount work -> stopping sessions for %s\n", sdev->name);
+        stop_sessions_for_bdev(sdev);
     }
-
-    /* Create new session */
-    timestamp = ktime_get_real_ns();
-    session = create_session(sdev, timestamp);
-    if (!session) {
-        pr_err("SNAPSHOT: Failed to create session for: %s\n", sdev->name);
-        goto cleanup;
-    }
-
-    /* Create snapshot subdirectory - use the device name from sdev */
-    ret = create_snapshot_subdirectory(session, sdev->name);
-    if (ret) {
-        pr_err("SNAPSHOT: Failed to create directory: %d\n", ret);
-        destroy_session(session);
-        goto cleanup;
-    }
-
-    /* Add session to device */
-    spin_lock(&sdev->lock);
-    list_add_tail(&session->list, &sdev->sessions);
-    spin_unlock(&sdev->lock);
-
-    /*Assign active session for device*/
-    rcu_assign_pointer(sdev->active_session, session); 
-
-    pr_info("SNAPSHOT: Session %llu started for device: %s\n", timestamp, sdev->name);
-
-cleanup:
-    kfree(mw);
+    cleanup:
+        kfree(mw);
 }
 
 /**
@@ -416,6 +421,7 @@ int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64
     INIT_WORK(&mw->work, mount_work_handler);
     mw->bdev = bdev;
     mw->sdev = sdev; 
+    mw->action = SNAP_WORK_START;
 
     /* Queue the work */
     if (!queue_work(snapshot_wq, &mw->work)) {
@@ -710,6 +716,47 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     put_session(ses);
     return 0;
 }
+
+
+static int kill_block_super_entry(struct kprobe *p, struct pt_regs *regs)
+{
+    struct super_block *sb;
+    struct block_device *bdev;
+    snapshot_device *sdev;
+
+    sb = (struct super_block *)regs->di;
+
+    if (!sb)
+        return 0;
+
+    
+    bdev = READ_ONCE(sb->s_bdev);
+    if (!bdev)
+        return 0;
+
+    sdev = find_device_for_bdev(bdev);
+    if (!sdev || !READ_ONCE(sdev->snapshot_active) || READ_ONCE(sdev->bdev) != bdev)
+        return 0;
+
+    struct mount_work *mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
+    if (!mw) return -ENOMEM;
+
+    INIT_WORK(&mw->work, mount_work_handler);
+    mw->bdev   = NULL;
+    mw->sdev   = sdev;
+    mw->action = SNAP_WORK_STOP;
+
+    if (!queue_work(snapshot_wq, &mw->work)) {
+        kfree(mw);
+        return -EAGAIN;
+    }
+
+    pr_info("SNAPSHOT: kill_block_super() detected for %s\n",
+        sdev->name);
+
+    return 0;
+}
+
 /**
  * Hook for __sbread_gfp to log read operations
  * NB: sb_bread can't be hooked because it is inlined
@@ -775,6 +822,36 @@ void remove_read_hook(void)
     pr_info("SNAPSHOT: Read hook removed (missed %d probes)\n", 
         __bread_gfp_kp.nmissed);
 }
+
+/* Kretprobe structure for hooking kill_block_super */
+static struct kprobe kill_block_super_kp = {
+    .symbol_name = "kill_block_super",
+    .pre_handler  = kill_block_super_entry,
+};
+
+/**
+ * install_unmount_hook - Install the unmount event hook
+ */
+int install_unmount_hook(void)
+{
+    int ret;
+    
+    ret = register_kprobe(&kill_block_super_kp);
+    if (ret < 0) {
+        pr_err("SNAPSHOT: Failed to register kprobe on unmount: %d\n", ret);
+        return ret;
+    }
+    return 0;
+}
+
+/**
+ * remove_unmount_hook - Remove the unmount event hook
+ */
+void remove_unmount_hook(void)
+{
+    unregister_kprobe(&kill_block_super_kp);
+}
+
 
 /**
  * snapshot_init - Initialize snapshot subsystem

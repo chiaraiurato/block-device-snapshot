@@ -266,6 +266,12 @@ int init_module(void) {
         }
         printk("%s: register __bread_gfp() hook successfully\n", MODNAME);
         
+        ret = install_unmount_hook();
+        if (ret < 0) {
+            printk("%s: Error while hooking kill_superblock\n", MODNAME);
+            return ret;
+        }
+        printk("%s: register kill_super_block() hook successfully\n", MODNAME);
         /* create workqueue for mounting sdev*/
         snapshot_init();
 
@@ -282,6 +288,7 @@ void cleanup_module(void) {
         remove_mount_hook();
         remove_write_hook();
         remove_read_hook();
+        remove_unmount_hook();
         unprotect_memory();
         for(int i=0;i<HACKED_ENTRIES;i++){
                 ((unsigned long *)the_syscall_table)[restore[i]] = the_ni_syscall;

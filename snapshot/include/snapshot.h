@@ -80,9 +80,13 @@ struct cow_work {
     unsigned int size;             /* FS block size (bytes) */
     sector_t sector_key;           /* key used in xarrays: sector units (512B) */
 };
+enum snap_work_action {
+    SNAP_WORK_START = 0, 
+    SNAP_WORK_STOP  = 1,  
+};
 
 /**
- * struct mount_work - Work structure for async mount handling
+ * struct mount_work - Work structure for async mount/unmount handling
  * @work: Work queue item
  * @bdev: Block device being mounted
  * @key: Device key 
@@ -91,7 +95,11 @@ struct mount_work {
     struct work_struct work;
     struct block_device *bdev;
     snapshot_device *sdev;
+    enum snap_work_action action; 
 };
+
+
+
 
 /* Core snapshot functions */
 int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts);
@@ -146,5 +154,11 @@ void remove_write_hook(void);
  */
 int install_read_hook(void);
 void remove_read_hook(void);
+
+/**
+ * install_unmount_hook - Install the unmount event hook
+ */
+int install_unmount_hook(void);
+void remove_unmount_hook(void);
 
 #endif
