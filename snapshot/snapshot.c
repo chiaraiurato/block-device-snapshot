@@ -85,6 +85,82 @@ struct cow_mem_work {
     void *data;               
 };
 
+static int snap_unlink_path(const char *path)
+{
+    struct path p;
+    struct dentry *parent;
+    struct inode *dir;
+    int err;
+
+    err = kern_path(path, LOOKUP_FOLLOW, &p);
+    if (err)
+        return err;
+
+    parent = dget_parent(p.dentry);
+    dir = d_inode(parent);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0)
+    err = vfs_unlink(mnt_idmap(p.mnt), dir, p.dentry, NULL);
+#else
+    err = vfs_unlink(dir, p.dentry, NULL);
+#endif
+
+    dput(parent);
+    path_put(&p);
+    return err;
+}
+
+static int snap_rmdir_path(const char *dirpath)
+{
+    struct path p;
+    struct dentry *parent;
+    struct inode *dir;
+    int err;
+
+    err = kern_path(dirpath, LOOKUP_DIRECTORY, &p);
+    if (err)
+        return err;
+
+    parent = dget_parent(p.dentry);  
+    dir = d_inode(parent);
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,3,0)
+    err = vfs_rmdir(mnt_idmap(p.mnt), dir, p.dentry);
+#else
+    err = vfs_rmdir(dir, p.dentry);
+#endif
+
+    dput(parent);
+    path_put(&p);
+    return err;
+}
+
+static void cleanup_empty_session(snapshot_session *session)
+{
+    char path[PATH_MAX];
+
+    if (session->data_file) { filp_close(session->data_file, NULL); session->data_file = NULL; }
+    if (session->map_file)  { filp_close(session->map_file,  NULL); session->map_file  = NULL; }
+
+    snprintf(path, PATH_MAX, "%s/blocks.dat", session->snapshot_dir);
+    if (snap_unlink_path(path))
+        pr_debug("SNAPSHOT: unlink failed : %s\n", path);
+
+    snprintf(path, PATH_MAX, "%s/blocks.map", session->snapshot_dir);
+    if (snap_unlink_path(path))
+        pr_debug("SNAPSHOT: unlink failed : %s\n", path);
+
+    snprintf(path, PATH_MAX, "%s/meta.json", session->snapshot_dir);
+    if (snap_unlink_path(path))
+        pr_debug("SNAPSHOT: unlink failed : %s\n", path);
+
+    /* remove the directory */
+    if (snap_rmdir_path(session->snapshot_dir))
+        pr_debug("SNAPSHOT: rmdir failed : %s\n", session->snapshot_dir);
+
+    pr_info("SNAPSHOT: Removed empty snapshot dir %s\n", session->snapshot_dir);
+}
+
 
 /**
  * create_session - Create a new snapshot session
@@ -126,19 +202,24 @@ void destroy_session(snapshot_session *session)
     pr_info("SNAPSHOT: Destroying session %llu\n", 
             session->timestamp);
     
-    /* Close files if still open */
-    if (session->data_file) {
-        filp_close(session->data_file, NULL);
-        session->data_file = NULL;
-    }
-    if (session->map_file) {
-        filp_close(session->map_file, NULL);
-        session->map_file = NULL;
+    
+    if (atomic64_read(&session->blocks_count) == 0) {
+        /* No blocks saved: remove directory */
+        cleanup_empty_session(session);
+    } else {
+        /* Close files if still open */
+        if (session->data_file) { filp_close(session->data_file, NULL); session->data_file = NULL; }
+        if (session->map_file)  { filp_close(session->map_file,  NULL); session->map_file  = NULL; }
     }
     
-    /* Free XArrays (using sentinel values, nothing to free) */
-    xa_for_each(&session->saved_blocks, index, entry) {
-        /* Sentinel values don't need freeing */
+    /* Free XArrays */
+    // xa_for_each(&session->saved_blocks, index, entry) {
+    //     /* Sentinel values don't need freeing */
+    // }
+
+    xa_for_each(&session->pending_block, index, entry) {
+        if (entry && !xa_is_value(entry))
+            kfree(entry);
     }
     
     xa_destroy(&session->saved_blocks);
