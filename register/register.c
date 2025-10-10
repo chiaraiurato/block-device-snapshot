@@ -293,7 +293,7 @@ static int mount_bdev_handler(struct kretprobe_instance *kp, struct pt_regs *reg
 static struct kretprobe mount_bdev_kp = {
     .kp.symbol_name = "mount_bdev",
     .handler = mount_bdev_handler,
-    .maxactive = 20, /* Handle up to 20 concurrent mounts */
+    .maxactive = -1,
 };
 
 /**
@@ -440,9 +440,4 @@ struct snapshot_device *find_device_by_bdev(struct block_device *bdev)
     }
     rcu_read_unlock();
     return NULL;
-}
-
-int restore_device(const char *devname){
-    pr_info("SNAPSHOT: Restoring snapshot for device %s\n", devname);
-    return 0;
 }

@@ -475,7 +475,8 @@ static void mount_work_handler(struct work_struct *work) {
         /*Assign active session for device*/
         rcu_assign_pointer(sdev->active_session, session); 
 
-        pr_info("SNAPSHOT: Session %llu started for device: %s\n", timestamp, sdev->name);
+        pr_info("SNAPSHOT: Session %llu started\n",
+            timestamp);
 
     } else { 
         pr_info("SNAPSHOT: Unmount work -> stopping sessions for %s\n", sdev->name);
@@ -530,24 +531,24 @@ int stop_sessions_for_bdev(snapshot_device *sdev)
 
     pr_info("SNAPSHOT: Stopping all sessions for: %s\n", sdev->name);
 
+    /* Get active session*/
+    rcu_read_lock();
+    session = rcu_dereference(sdev->active_session);
+    rcu_read_unlock();
+
+    if (!session)
+        return 0;
+
     /* Detach under spinlock */
     spin_lock(&sdev->lock);
     RCU_INIT_POINTER(sdev->active_session, NULL);
-
-    /* Move all sessions to a private list so we can free them later */
-    list_for_each_entry_safe(session, tmp, &sdev->sessions, list) {
-        list_move_tail(&session->list, &to_free);
-    }
-    sdev->bdev = NULL;
+    list_del_init(&session->list);
     spin_unlock(&sdev->lock);
 
-    synchronize_rcu();
 
-    /* Destroy sessions*/
-    list_for_each_entry_safe(session, tmp, &to_free, list) {
-        list_del_init(&session->list);
-        destroy_session(session);
-    }
+    /* Do not destroy session here, we must let finish our workers*/
+    //release the main ref that was added when the session was created
+    put_session(session);
     return 0;
 }
 static void cow_mem_worker(struct work_struct *w)
@@ -615,7 +616,7 @@ static void cow_mem_worker(struct work_struct *w)
 
 out:
     xa_erase(&session->pending_block, mw->sector_key);
-    put_session(session);
+    put_session(session); //release the ref count after work is done
     kfree(mw->data);
     kfree(mw);
 }
@@ -630,7 +631,6 @@ static int enqueue_cow_mem(snapshot_session *session,
     int ret;
 
     /* Here we assume block is not saved, already checked in the caller */
-
     /* Try to mark as pending (atomic insert) */
     ret = xa_insert(&session->pending_block, sector_key, xa_mk_value(1), GFP_ATOMIC);
     if (ret == -EBUSY) {
@@ -653,6 +653,7 @@ static int enqueue_cow_mem(snapshot_session *session,
     mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
     if (!mw) {
         kfree(copy);
+
         xa_erase(&session->pending_block, sector_key);
         return -ENOMEM;
     }
@@ -662,13 +663,12 @@ static int enqueue_cow_mem(snapshot_session *session,
     mw->sector_key = sector_key;
     mw->size       = size;
     mw->data       = copy;
-
-    /* Increment session refcount */
-    atomic_inc(&session->ref_count);
-
+    //before queueing the work we need to increment the ref count
+    get_session(session);
     /* Queue work */
     if (!queue_work(snapshot_wq, &mw->work)) {
         xa_erase(&session->pending_block, sector_key);
+        //release the ref count if failed
         put_session(session);
         kfree(copy);
         kfree(mw);
@@ -712,8 +712,7 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
     if (xa_load(&ses->saved_blocks, key)) {
         pr_info("SNAPSHOT: Block already saved key=%llu\n", 
                 (unsigned long long)key);
-        put_session(ses);
-        return 0;
+        goto clean;
     }
 
     snap_dump_bh("WRITE_CONFIRMED", bh, key, true);
@@ -723,13 +722,11 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
         /* Write without caching */
         pr_warn_ratelimited("SNAPSHOT: Write without caching blk=%llu key=%llu\n",
                             (unsigned long long)bh->b_blocknr, (unsigned long long)key);
-        put_session(ses);
-        return 0;
+        goto clean;
     }
     if (xa_is_value(entry)) {
         pr_info("SNAPSHOT: COW already pending key=%llu\n", (unsigned long long)key);
-        put_session(ses);
-        return 0;
+        goto clean;
     }
 
     void *old_data = xa_erase(&ses->pending_block, key);
@@ -741,12 +738,14 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
         if (ret > 0) {
             pr_info("SNAPSHOT: COW confirmed and queued blk=%llu key=%llu\n",
                     (unsigned long long)bh->b_blocknr, (unsigned long long)key);
+            //pass the ref count to worker
+            return 0;
         } else if (ret && ret != -EBUSY) {
             pr_warn_ratelimited("SNAPSHOT: COW enqueue failed key=%llu err=%d\n",
                                 (unsigned long long)key, ret);
         }
     }
-    put_session(ses);
+clean:
     return 0;
 }
 
@@ -796,19 +795,18 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     snap_dump_bh("COW_CAPTURE", bh, key, false);
 
     if (xa_load(&ses->saved_blocks, key) || xa_load(&ses->pending_block, key)) {
-        put_session(ses);
         return 0;
     }
     snap_dump_bh("COW_CAPTURE", bh, key, false);
 
     /* Copy old data */
+    //TODO: we need to handle high memory allocation 
     void *copy = kmemdup(bh->b_data, bh->b_size, GFP_ATOMIC);
     if (!copy) {
-        put_session(ses);
         return 0;
     }
 
-    /* Only the first thread can do the inser the other do kfree */
+    /* Only the first thread can do the insert, the other do kfree */
     if (xa_insert(&ses->pending_block, key, copy, GFP_ATOMIC)) {
         kfree(copy);
     } else {
@@ -817,7 +815,6 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
                 (size_t)bh->b_size,
                 (unsigned long long)key);
     }
-    put_session(ses);
     return 0;
 }
 
@@ -833,7 +830,6 @@ static int kill_block_super_entry(struct kprobe *p, struct pt_regs *regs)
 
     if (!sb)
         return 0;
-
     
     bdev = READ_ONCE(sb->s_bdev);
     if (!bdev)
@@ -863,8 +859,7 @@ static int kill_block_super_entry(struct kprobe *p, struct pt_regs *regs)
 }
 
 /**
- * Hook for __sbread_gfp to log read operations
- * NB: sb_bread can't be hooked because it is inlined
+ * Hook for write_dirty_buffer
  */
 static struct kprobe write_dirty_buffer_kp = {
     .symbol_name = "write_dirty_buffer",
@@ -893,14 +888,16 @@ void remove_write_hook(void)
 {
     unregister_kprobe(&write_dirty_buffer_kp);
 }
-
-/* Kretprobe structure for hooking __sbread */
+/**
+ * Hook for __sbread_gfp to log read operations
+ * NB: sb_bread can't be hooked because it is inlined
+ */
 static struct kretprobe __bread_gfp_kp = {
     .kp.symbol_name = "__bread_gfp",
     .entry_handler  = bread_entry,
     .handler = __bread_gfp_handler,
     .data_size      = sizeof(struct bread_ctx),
-    .maxactive = 64, 
+    .maxactive = -1, 
 };
 
 /**

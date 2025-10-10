@@ -12,16 +12,16 @@
 #define DEFAULT_BLOCK_SIZE 4096
 
 
-/** struct block_data - Stored block data 
- * @sector: Sector number 
- * @data: Block content 
- * @size: Size of the block
- */ 
-struct block_data { 
-    sector_t sector; 
-    void *data;
-    size_t size;
-};
+// /** struct block_data - Stored block data 
+//  * @sector: Sector number 
+//  * @data: Block content 
+//  * @size: Size of the block
+//  */ 
+// struct block_data { 
+//     sector_t sector; 
+//     void *data;
+//     size_t size;
+// };
 
 /**
  * struct snapshot_session - Represents a snapshot session
@@ -34,6 +34,10 @@ struct block_data {
  * @blocks_count: Count of blocks saved in this session
  * @list: List head for linking sessions
  * @ref_count: Reference counter for safe cleanup
+ * @map_file: File pointer for blocks.map
+ * @data_file: File pointer for blocks.dat
+ * @map_pos: Current write position in blocks.map
+ * @data_pos: Current write position in blocks.dat
  */
 typedef struct {
     u64 timestamp;              
@@ -100,7 +104,6 @@ struct mount_work {
 
 
 
-
 /* Core snapshot functions */
 int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts);
 int stop_sessions_for_bdev(snapshot_device *sdev);
@@ -124,15 +127,28 @@ static inline snapshot_session *get_active_session_rcu(snapshot_device *sdev)
     rcu_read_lock();
     session = rcu_dereference(sdev->active_session);
     if (session)
-        atomic_inc(&session->ref_count); 
     rcu_read_unlock();
     return session;
+}
+
+static inline snapshot_session *get_session(snapshot_session *ses)
+{
+    if (ses)
+        atomic_inc(&ses->ref_count);
+    return ses;
 }
 
 static inline void put_session(snapshot_session *ses)
 {
     if (!ses) return;
-    atomic_dec(&ses->ref_count);
+
+    if (atomic_dec_and_test(&ses->ref_count)) {
+        pr_info("SNAPSHOT: put_session: DESTROYING session %llu\n", ses->timestamp);
+        destroy_session(ses); 
+    } else {
+        pr_debug("SNAPSHOT: put_session: session %llu refcount is now %d\n", 
+                 ses->timestamp, atomic_read(&ses->ref_count));
+    }
 }
 /* Workqueue initialization */
 int snapshot_init(void);
