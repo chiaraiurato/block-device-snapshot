@@ -89,4 +89,9 @@ int install_mount_hook(void);
  */
 void remove_mount_hook(void);
 
+
+int install_get_tree_bdev_hook(void);
+
+void remove_get_tree_bdev_hook(void);
+
 #endif /* _REGISTER_H */

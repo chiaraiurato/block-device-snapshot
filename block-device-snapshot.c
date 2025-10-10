@@ -80,6 +80,10 @@ static char the_snapshot_secret[HASH_LEN];
 module_param_string(the_snapshot_secret, the_snapshot_secret, HASH_LEN, 0);
 MODULE_PARM_DESC(the_snapshot_secret, "Password used for authentication");
 
+static bool use_bio_layer = true;
+module_param_named(use_bio_layer, use_bio_layer, bool, 0644);
+MODULE_PARM_DESC(use_bio_layer, "Use BIO-layer kprobe (true) or buffer-cache kprobes (false)");
+
 static int handle_snapshot_operation(const char __user *devname, 
                                      const char __user *passwd,
                                      bool activate)
@@ -246,32 +250,43 @@ int init_module(void) {
 
         printk("all new system-calls correctly installed on sys-call table\n");
 
-        ret = install_mount_hook();
-        if (ret < 0) {
-            printk("%s: Error while hooking mount_bdev()\n", MODNAME);
-            return ret;
-        }
-        printk("%s: register mount_bdev() hook successfully\n", MODNAME);
+        if (use_bio_layer) {
+            ret = install_bio_kprobe();
+            if (ret < 0) {
+                printk("%s: BIO kprobe install error\n", MODNAME);
+                return ret;
+            }
+            printk("%s: BIO kprobe installed\n", MODNAME);
+            ret = install_get_tree_bdev_hook();
+            if (ret < 0) {
+                printk("%s: get_tree_bdev kprobe install error\n", MODNAME);
+                return ret;
+            }
+            printk("%s: BIO kprobe installed\n", MODNAME);
+        } else {
+            ret = install_mount_hook();
+            if (ret < 0) {
+                printk("%s: Error while hooking mount_bdev()\n", MODNAME);
+                return ret;
+            }
+            printk("%s: register mount_bdev() hook successfully\n", MODNAME);
+
+            ret = install_write_hook();
+            if (ret < 0) { printk("%s: write hook err\n", MODNAME); return ret; }
+            printk("%s: register write_dirty_buffer() hook successfully\n", MODNAME);
         
-        ret = install_write_hook();
-        if (ret < 0) {
-            printk("%s: Error while hooking write_dirty_buffer()\n", MODNAME);
-            return ret;
+            ret = install_read_hook();
+            if (ret < 0) { printk("%s: read hook err\n", MODNAME); return ret; }
+            printk("%s: register __bread_gfp() hook successfully\n", MODNAME);
+
+            ret = install_unmount_hook();
+            if (ret < 0) {
+                printk("%s: Error while hooking kill_superblock\n", MODNAME);
+                return ret;
+            }
+            printk("%s: register kill_super_block() hook successfully\n", MODNAME);
         }
-        printk("%s: register write_dirty_buffer() hook successfully\n", MODNAME);
-        ret = install_read_hook();
-        if (ret < 0) {
-            printk("%s: Error while hooking __bread_gfp()\n", MODNAME);
-            return ret;
-        }
-        printk("%s: register __bread_gfp() hook successfully\n", MODNAME);
         
-        ret = install_unmount_hook();
-        if (ret < 0) {
-            printk("%s: Error while hooking kill_superblock\n", MODNAME);
-            return ret;
-        }
-        printk("%s: register kill_super_block() hook successfully\n", MODNAME);
         /* create workqueue for mounting sdev*/
         snapshot_init();
 
@@ -285,10 +300,16 @@ void cleanup_module(void) {
         printk("%s: shutting down\n",MODNAME);
         //remove all hooks
         // TODO : refactor to remove all hooks in a single function
-        remove_mount_hook();
-        remove_write_hook();
-        remove_read_hook();
-        remove_unmount_hook();
+        if (use_bio_layer) {
+            remove_bio_kprobe();
+            remove_get_tree_bdev_hook();
+        } else {
+            remove_mount_hook();
+            remove_unmount_hook();
+            remove_write_hook();
+            remove_read_hook();
+        }
+
         unprotect_memory();
         for(int i=0;i<HACKED_ENTRIES;i++){
                 ((unsigned long *)the_syscall_table)[restore[i]] = the_ni_syscall;

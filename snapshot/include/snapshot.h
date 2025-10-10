@@ -9,8 +9,8 @@
 #include <linux/bio.h>
 /* Maximum length of a device name */
 #define MAX_DEV_LEN 256
-#define DEFAULT_BLOCK_SIZE 4096
-
+#define COW_BLK_SZ          4096u
+#define COW_SECT_SZ         512u
 
 // /** struct block_data - Stored block data 
 //  * @sector: Sector number 
@@ -150,6 +150,11 @@ static inline void put_session(snapshot_session *ses)
                  ses->timestamp, atomic_read(&ses->ref_count));
     }
 }
+
+static int enqueue_cow_mem(snapshot_session *session,
+    sector_t sector_key,
+    const void *src,
+    unsigned int size);
 /* Workqueue initialization */
 int snapshot_init(void);
 void snapshot_exit(void);
@@ -177,5 +182,10 @@ void remove_read_hook(void);
 int install_unmount_hook(void);
 void remove_unmount_hook(void);
 
+/**
+ * install_bio_hook - Install the bio event hook
+ */
+int install_bio_kprobe(void);
+void remove_bio_kprobe(void);
 
 #endif

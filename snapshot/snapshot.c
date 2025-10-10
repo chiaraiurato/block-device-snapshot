@@ -261,7 +261,7 @@ static int update_metadata_file(snapshot_session *session, const char *raw_devna
                      "}\n",
                      raw_devname,
                      session->timestamp,
-                     DEFAULT_BLOCK_SIZE,
+                     COW_BLK_SZ,
                      fs_type,
                      atomic64_read(&session->blocks_count));
 

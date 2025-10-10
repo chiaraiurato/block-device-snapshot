@@ -8,6 +8,7 @@
 #include <linux/namei.h>
 #include <linux/ctype.h>
 #include <linux/limits.h>
+#include <linux/fs_context.h> 
 #include "include/register.h"
 #include "../snapshot/include/snapshot.h"
 
@@ -295,6 +296,41 @@ static struct kretprobe mount_bdev_kp = {
     .handler = mount_bdev_handler,
     .maxactive = -1,
 };
+// For bio layer interception we use get_tree_bdev
+struct gt_ctx { struct fs_context *fc; };
+
+static int get_tree_bdev_entry(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+#if defined(CONFIG_X86_64)
+    struct gt_ctx *c = (struct gt_ctx *)ri->data;
+    c->fc = (struct fs_context *)regs->di;  /* 1° arg: struct fs_context * */
+#endif
+    return 0;
+}
+
+static int get_tree_bdev_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
+{
+    struct gt_ctx *c = (struct gt_ctx *)ri->data;
+    int ret = (int)regs_return_value(regs);
+    pr_info("SNAPSHOT: mount matched");
+    /*Obtain s_bdev*/
+    if (ret == 0 && c && c->fc && c->fc->root && c->fc->root->d_sb) {
+        struct super_block *sb = c->fc->root->d_sb;
+        if (sb->s_bdev) {
+            handle_mount_event(sb->s_bdev);
+        }
+    }
+    return 0;
+}
+
+static struct kretprobe get_tree_bdev_kp = {
+    .kp.symbol_name = "get_tree_bdev",
+    .entry_handler  = get_tree_bdev_entry,
+    .handler        = get_tree_bdev_ret,
+    .data_size      = sizeof(struct gt_ctx),
+    .maxactive      = -1,
+};
+
 
 /**
  * install_mount_hook - Install the mount event hook
@@ -321,6 +357,30 @@ void remove_mount_hook(void)
             mount_bdev_kp.nmissed);
 }
 
+/**
+ * install_get_tree_bdev_hook - Install the mount event hook
+ */
+int install_get_tree_bdev_hook(void)
+{
+    int ret;
+    
+    ret = register_kretprobe(&get_tree_bdev_kp);
+    if (ret < 0) {
+        pr_err("SNAPSHOT: Failed to register kretprobe on mount: %d\n", ret);
+        return ret;
+    }
+    return 0;
+}
+
+/**
+ * remove_get_tree_bdev_hook - Remove the mount event hook
+ */
+void remove_get_tree_bdev_hook(void)
+{
+    unregister_kretprobe(&get_tree_bdev_kp);
+    pr_info("SNAPSHOT: Mount hook removed (missed %d probes)\n", 
+        get_tree_bdev_kp.nmissed);
+}
 /**
  * register_device - Register a new device for snapshotting
  * @devname: User provided device name

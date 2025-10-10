@@ -1,5 +1,5 @@
 obj-m += the_block-device-snapshot.o
-the_block-device-snapshot-objs += block-device-snapshot.o lib/scth.o utils/auth.o register/register.o snapshot/snapshot.o
+the_block-device-snapshot-objs += block-device-snapshot.o lib/scth.o utils/auth.o register/register.o snapshot/snapshot.o snapshot/snapshot_bio.o
 
 MOUNT_PATH = mount
 USER_APP = user/user.out
@@ -22,6 +22,10 @@ create-singlefilefs:
 	dd bs=4096 count=100 if=/dev/zero of=image
 	./singlefilemakefs image
 	mkdir $(MOUNT_PATH)
+
+create-ext4:
+	dd if=/dev/zero of=ext4.img bs=1M count=100
+	mkfs.ext4 -b 4096 ext4.img
 
 mount:
 	@echo "Mounting modules..."
@@ -59,7 +63,7 @@ mount:
 	echo "[mount] loading the_block-device-snapshot.ko"; \
 	sudo insmod the_block-device-snapshot.ko \
 		the_syscall_table=$$SYS_CALL_TABLE \
-		the_snapshot_secret=$$SECR3T_VAL || { echo "ERROR: failed to load snapshot"; exit 1; }
+		the_snapshot_secret=$$SECR3T_VAL use_bio_layer=1 || { echo "ERROR: failed to load snapshot"; exit 1; }
 
 load-fs:
 	sudo insmod $(SINGLEFILE_FS_DIR)/singlefilefs.ko
@@ -72,6 +76,9 @@ mount-fs:
 unmount-fs:
 	sudo umount $(MOUNT_PATH)/ -f
 	@echo "Singlefile-fs unmounted successfully"
+
+mount-ext4:
+	sudo mount -o loop -t ext4 ext4.img ./$(MOUNT_PATH)/
 
 compile-user:
 	@echo "Compiling user application..."
