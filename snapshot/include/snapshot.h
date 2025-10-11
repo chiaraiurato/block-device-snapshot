@@ -12,17 +12,6 @@
 #define COW_BLK_SZ          4096u
 #define COW_SECT_SZ         512u
 
-// /** struct block_data - Stored block data 
-//  * @sector: Sector number 
-//  * @data: Block content 
-//  * @size: Size of the block
-//  */ 
-// struct block_data { 
-//     sector_t sector; 
-//     void *data;
-//     size_t size;
-// };
-
 /**
  * struct snapshot_session - Represents a snapshot session
  * @timestamp: Unique identifier for the snapshot session
@@ -93,19 +82,22 @@ enum snap_work_action {
  * struct mount_work - Work structure for async mount/unmount handling
  * @work: Work queue item
  * @bdev: Block device being mounted
- * @key: Device key 
+ * @sdev: Associated snapshot device
+ * @fs_type: Filesystem type being mounted
+ * @action: Action to perform (start or stop session) 
  */
 struct mount_work {
     struct work_struct work;
     struct block_device *bdev;
     snapshot_device *sdev;
+    const char *fs_type;
     enum snap_work_action action; 
 };
 
 
 
 /* Core snapshot functions */
-int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts);
+int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts, const char *fs_type);
 int stop_sessions_for_bdev(snapshot_device *sdev);
 
 
@@ -153,7 +145,7 @@ static inline void put_session(snapshot_session *ses)
 
 static int enqueue_cow_mem(snapshot_session *session,
     sector_t sector_key,
-    const void *src,
+    void *src,
     unsigned int size);
 /* Workqueue initialization */
 int snapshot_init(void);

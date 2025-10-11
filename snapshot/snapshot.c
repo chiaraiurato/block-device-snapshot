@@ -10,6 +10,7 @@
 #include <linux/version.h>
 #include <linux/limits.h>
 #include <linux/kprobes.h>
+#include <linux/bio.h>
 #include <linux/buffer_head.h>
 #include "include/snapshot.h"
 #include <linux/mnt_idmapping.h>
@@ -18,6 +19,10 @@
 #include <linux/printk.h>
 #include <linux/ratelimit.h>
 #include <linux/bitops.h>
+
+#define COW_SECT_PER_BLK    (COW_BLK_SZ / COW_SECT_SZ)
+#define ALIGN_DOWN_SECT(s)  ((s) & ~((sector_t)COW_SECT_PER_BLK - 1))
+#define ALIGN_UP_SECT(s)    (((s) + COW_SECT_PER_BLK - 1) & ~((sector_t)COW_SECT_PER_BLK - 1))
 
 static bool snap_trace = true;             /* master on/off */
 module_param_named(trace, snap_trace, bool, 0644);
@@ -68,8 +73,9 @@ static void snap_dump_bh(const char *tag, struct buffer_head *bh,
     }
 }
 
-/* Workqueue for handling mount events */
+/* Workqueue for handling events */
 static struct workqueue_struct *snapshot_wq;
+static struct workqueue_struct *snapshot_bio_wq;
 
 struct snapshot_rec {
     u64 sector;   /* key (512B) */
@@ -83,6 +89,15 @@ struct cow_mem_work {
     sector_t sector_key;     
     unsigned int size;       
     void *data;               
+};
+
+// TODO: Refactor this struct 
+struct preimage_work { 
+    struct work_struct work; 
+    snapshot_session *ses; 
+    struct block_device *bdev; 
+    sector_t key; 
+    unsigned int size; 
 };
 
 static int snap_unlink_path(const char *path)
@@ -212,11 +227,6 @@ void destroy_session(snapshot_session *session)
         if (session->map_file)  { filp_close(session->map_file,  NULL); session->map_file  = NULL; }
     }
     
-    /* Free XArrays */
-    // xa_for_each(&session->saved_blocks, index, entry) {
-    //     /* Sentinel values don't need freeing */
-    // }
-
     xa_for_each(&session->pending_block, index, entry) {
         if (entry && !xa_is_value(entry))
             kfree(entry);
@@ -232,15 +242,13 @@ void destroy_session(snapshot_session *session)
 /**
  * update_metadata_file - Update meta.json with final statistics
  */
-static int update_metadata_file(snapshot_session *session, const char *raw_devname)
+static int update_metadata_file(snapshot_session *session, const char *raw_devname, const char *fs_type)
 {
     char *pmeta = kmalloc(PATH_MAX, GFP_KERNEL);
     char meta[1024];
     size_t mlen;
     struct file *mf;
     loff_t pos = 0;
-    //TODO: find a way to retrieve the filesystem type
-    const char *fs_type = "singlefile-fs";
     int ret = 0;
 
     if (!pmeta)
@@ -294,7 +302,7 @@ out:
 /**
  * create_files_and_meta_for_session - Create snapshot files
  */
-static int create_files_and_meta_for_session(snapshot_session *session, const char *raw_devname)
+static int create_files_and_meta_for_session(snapshot_session *session, const char *raw_devname, const char *fs_type)
 {
     char *pmap = kmalloc(PATH_MAX, GFP_KERNEL);
     char *pdat = kmalloc(PATH_MAX, GFP_KERNEL);
@@ -334,7 +342,7 @@ static int create_files_and_meta_for_session(snapshot_session *session, const ch
     }
 
     /* Create initial metadata */
-    update_metadata_file(session, raw_devname);
+    update_metadata_file(session, raw_devname, fs_type);
 
     pr_info("SNAPSHOT: Created snapshot files in %s\n", session->snapshot_dir);
 
@@ -351,7 +359,7 @@ cleanup:
  * Called from workqueue context 
  */
 static int create_snapshot_subdirectory(snapshot_session *session, 
-                                       const char *raw_devname)
+                                       const char *raw_devname, const char *fs_type)
 {
     char basename_only[MAX_DEV_LEN];
     struct path parent_path;
@@ -414,7 +422,7 @@ static int create_snapshot_subdirectory(snapshot_session *session,
         pr_info("SNAPSHOT: Directory created: %s\n", path);
         err = 0;
     }
-    err = create_files_and_meta_for_session(session, raw_devname);
+    err = create_files_and_meta_for_session(session, raw_devname, fs_type);
     if (err) {
         pr_err("SNAPSHOT: creation/open files/meta failed: %d\n", err);
         return err;
@@ -460,7 +468,7 @@ static void mount_work_handler(struct work_struct *work) {
         }
 
         /* Create snapshot subdirectory - use the device name from sdev */
-        ret = create_snapshot_subdirectory(session, sdev->name);
+        ret = create_snapshot_subdirectory(session, sdev->name, mw->fs_type);
         if (ret) {
             pr_err("SNAPSHOT: Failed to create directory: %d\n", ret);
             destroy_session(session);
@@ -491,7 +499,7 @@ static void mount_work_handler(struct work_struct *work) {
  * 
  * Called from kprobe handler
  */
-int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts) {
+int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts, const char *fs_type) {
     struct mount_work *mw;
 
     /* Allocate work structure */
@@ -503,6 +511,7 @@ int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64
     INIT_WORK(&mw->work, mount_work_handler);
     mw->bdev = bdev;
     mw->sdev = sdev; 
+    mw->fs_type = fs_type;
     mw->action = SNAP_WORK_START;
 
     /* Queue the work */
@@ -613,9 +622,10 @@ static void cow_mem_worker(struct work_struct *w)
 
     /* Mark as saved */
     xa_store(&session->saved_blocks, mw->sector_key, xa_mk_value(1), GFP_KERNEL);
+    /* Remove as pending */
+    xa_erase(&session->pending_block, mw->sector_key);
 
 out:
-    xa_erase(&session->pending_block, mw->sector_key);
     put_session(session); //release the ref count after work is done
     kfree(mw->data);
     kfree(mw);
@@ -623,38 +633,14 @@ out:
 
 static int enqueue_cow_mem(snapshot_session *session,
                            sector_t sector_key,
-                           const void *src,
+                           void *src,
                            unsigned int size)
 {
     struct cow_mem_work *mw;
-    void *copy;
-    int ret;
-
-    /* Here we assume block is not saved, already checked in the caller */
-    /* Try to mark as pending (atomic insert) */
-    ret = xa_insert(&session->pending_block, sector_key, xa_mk_value(1), GFP_ATOMIC);
-    if (ret == -EBUSY) {
-        /* Already being processed by another thread */
-        return 0;
-    }
-    if (ret) {
-        pr_err_ratelimited("SNAPSHOT: xa_insert failed: %d\n", ret);
-        return ret;
-    }
-
-    /* Allocate memory copy of original data */
-    copy = kmemdup(src, size, GFP_ATOMIC);
-    if (!copy) {
-        xa_erase(&session->pending_block, sector_key);
-        return -ENOMEM;
-    }
 
     /* Allocate work structure */
     mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
     if (!mw) {
-        kfree(copy);
-
-        xa_erase(&session->pending_block, sector_key);
         return -ENOMEM;
     }
 
@@ -662,15 +648,13 @@ static int enqueue_cow_mem(snapshot_session *session,
     mw->session    = session;
     mw->sector_key = sector_key;
     mw->size       = size;
-    mw->data       = copy;
+    mw->data       = src;
     //before queueing the work we need to increment the ref count
     get_session(session);
     /* Queue work */
     if (!queue_work(snapshot_wq, &mw->work)) {
-        xa_erase(&session->pending_block, sector_key);
         //release the ref count if failed
         put_session(session);
-        kfree(copy);
         kfree(mw);
         return -EAGAIN;
     }
@@ -690,13 +674,11 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
     snapshot_device *sdev;
     snapshot_session *ses;
     sector_t key;
-    //void *orig_data;
     int ret;
 
     if (!bh || !bh->b_bdev)
         return 0;
 
-    /* Trova il device registrato */
     sdev = find_device_for_bdev(bh->b_bdev);
     if (!sdev || !READ_ONCE(sdev->snapshot_active) ||
         READ_ONCE(sdev->bdev) != bh->b_bdev)
@@ -712,40 +694,33 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
     if (xa_load(&ses->saved_blocks, key)) {
         pr_info("SNAPSHOT: Block already saved key=%llu\n", 
                 (unsigned long long)key);
-        goto clean;
+        return 0;
     }
 
     snap_dump_bh("WRITE_CONFIRMED", bh, key, true);
-
-    void *entry = xa_load(&ses->pending_block, key);
-    if (!entry) {
-        /* Write without caching */
-        pr_warn_ratelimited("SNAPSHOT: Write without caching blk=%llu key=%llu\n",
-                            (unsigned long long)bh->b_blocknr, (unsigned long long)key);
-        goto clean;
+    /*Take old data and replace data with a sentinel*/
+    void *prev = xa_store(&ses->pending_block, key, xa_mk_value(1), GFP_ATOMIC);
+    if (xa_err(prev)) {
+        pr_warn_ratelimited("SNAPSHOT: xa_store err=%ld key=%llu\n",
+                            PTR_ERR(prev), (unsigned long long)key);
+        return 0;
     }
-    if (xa_is_value(entry)) {
-        pr_info("SNAPSHOT: COW already pending key=%llu\n", (unsigned long long)key);
-        goto clean;
+    if (!prev || xa_is_value(prev)) {
+        return 0;
     }
-
-    void *old_data = xa_erase(&ses->pending_block, key);
-    if (old_data && !xa_is_value(old_data)) {
-        /* Persist block on disk*/
-        int ret = enqueue_cow_mem(ses, key, old_data, bh->b_size);
-        kfree(old_data);
-
-        if (ret > 0) {
-            pr_info("SNAPSHOT: COW confirmed and queued blk=%llu key=%llu\n",
-                    (unsigned long long)bh->b_blocknr, (unsigned long long)key);
-            //pass the ref count to worker
-            return 0;
-        } else if (ret && ret != -EBUSY) {
-            pr_warn_ratelimited("SNAPSHOT: COW enqueue failed key=%llu err=%d\n",
-                                (unsigned long long)key, ret);
+    /* Enqueue work to save old data */
+    ret = enqueue_cow_mem(ses, key, prev, bh->b_size);
+    if (ret < 0) {
+        void *rb = xa_store(&ses->pending_block, key, prev, GFP_ATOMIC);
+        if (xa_err(rb)) {
+            kfree(prev);
         }
+        pr_warn_ratelimited("SNAPSHOT: enqueue failed key=%llu err=%d\n",
+                            (unsigned long long)key, ret);
+    } else {
+        pr_info("SNAPSHOT: COW confirmed and queued blk=%llu key=%llu\n",
+                (unsigned long long)bh->b_blocknr, (unsigned long long)key);
     }
-clean:
     return 0;
 }
 
@@ -766,7 +741,7 @@ static int bread_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
 /**
  * __bread_gfp_handler - Main COW hook
  * 
- * Intercepts block reads and saves original content BEFORE any write occurs
+ * Intercepts block reads and insert old data into pending_block XArray
  */
 static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
@@ -797,10 +772,9 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     if (xa_load(&ses->saved_blocks, key) || xa_load(&ses->pending_block, key)) {
         return 0;
     }
-    snap_dump_bh("COW_CAPTURE", bh, key, false);
 
     /* Copy old data */
-    //TODO: we need to handle high memory allocation 
+    //100 blocks with 4096 bytes = ~400KB not a big deal 
     void *copy = kmemdup(bh->b_data, bh->b_size, GFP_ATOMIC);
     if (!copy) {
         return 0;
@@ -899,6 +873,158 @@ static struct kretprobe __bread_gfp_kp = {
     .data_size      = sizeof(struct bread_ctx),
     .maxactive = -1, 
 };
+
+static int read_old_block(struct block_device *bdev, sector_t key, void *buf, unsigned int size)
+{
+    struct page *page;
+    int ret;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,17,0)
+    struct bio *bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
+#else
+    struct bio *bio = bio_alloc(GFP_KERNEL, 1);
+    bio = bio_alloc(GFP_KERNEL, 1);
+    if (!bio) return -ENOMEM;
+    bio_set_dev(bio, bdev);
+    bio_set_op_attrs(bio, REQ_OP_READ, 0);
+#endif
+    if (!bio) return -ENOMEM;
+
+    bio->bi_iter.bi_sector = key;
+
+    page = alloc_page(GFP_KERNEL);
+    if (!page) { bio_put(bio); return -ENOMEM; }
+
+    if (bio_add_page(bio, page, size, 0) != size) {
+        __free_page(page);
+        bio_put(bio);
+        return -EINVAL;
+    }
+
+    ret = submit_bio_wait(bio);
+    if (!ret) {
+        void *k = kmap_local_page(page);
+        memcpy(buf, k, size);
+        kunmap_local(k);
+    }
+
+    __free_page(page);
+    bio_put(bio);
+    return ret;
+}
+
+static void preimage_worker(struct work_struct *w)
+{
+    struct preimage_work *pw = container_of(w, struct preimage_work, work);
+    snapshot_session *ses = pw->ses;
+    void *copy = NULL;
+
+    /* Same logic as buffer cache */
+    if (xa_load(&ses->saved_blocks, pw->key)) goto out_put;
+    if (xa_insert(&ses->pending_block, pw->key, xa_mk_value(1), GFP_KERNEL)) goto out_put;
+
+    copy = kmalloc(pw->size, GFP_KERNEL);
+    if (!copy) goto out_clear;
+
+    if (!read_old_block(pw->bdev, pw->key, copy, pw->size)) {
+        int ret = enqueue_cow_mem(ses, pw->key, copy, pw->size);
+        if (ret <= 0) kfree(copy);  
+    } else {
+        kfree(copy);
+    }
+
+out_clear:
+    xa_erase(&ses->pending_block, pw->key);
+out_put:
+    put_session(ses);
+    kfree(pw);
+}
+
+static void schedule_preimages_for_bio(snapshot_session *ses, struct block_device *bdev, struct bio *bio)
+{
+    sector_t first = bio->bi_iter.bi_sector;
+    unsigned int bytes = bio->bi_iter.bi_size;
+    sector_t start = ALIGN_DOWN_SECT(first);
+    sector_t end   = ALIGN_UP_SECT(first + (bytes >> 9));
+
+    for (sector_t key = start; key < end; key += COW_SECT_PER_BLK) {
+        struct preimage_work *pw;
+
+        if (xa_load(&ses->saved_blocks, key)) continue;
+        if (xa_load(&ses->pending_block, key)) continue;
+
+        pw = kzalloc(sizeof(*pw), GFP_ATOMIC);
+        if (!pw) break;
+
+        INIT_WORK(&pw->work, preimage_worker);
+        pw->ses  = get_session(ses);
+        pw->bdev = bdev;
+        pw->key  = key;
+        pw->size = COW_BLK_SZ;
+
+        queue_work(snapshot_bio_wq, &pw->work);
+    }
+}
+
+static int submit_bio_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    struct bio *bio = (struct bio *)regs->di;
+    snapshot_device *sdev;
+    snapshot_session *ses;
+
+    if (!bio || !bio->bi_bdev) return 0;
+    if (!op_is_write(bio_op(bio))) return 0; 
+
+    sdev = find_device_for_bdev(bio->bi_bdev);
+    if (!sdev || !READ_ONCE(sdev->snapshot_active) ||
+        READ_ONCE(sdev->bdev) != bio->bi_bdev)
+        return 0;
+
+    ses = get_active_session_rcu(sdev);
+    if (!ses) return 0;
+
+    pr_info_ratelimited("SNAPSHOT: submit_bio WRITE dev=%s secs=%llu len=%u\n",
+        bio->bi_bdev->bd_disk ? bio->bi_bdev->bd_disk->disk_name : "?",
+        (unsigned long long)bio->bi_iter.bi_sector,
+        bio->bi_iter.bi_size);
+
+    schedule_preimages_for_bio(ses, bio->bi_bdev, bio);
+    return 0;
+}
+
+
+static struct kprobe kp_submit_bio = { 
+    .symbol_name = "submit_bio",          
+    .pre_handler = submit_bio_pre_handler
+};
+
+int install_bio_kprobe(void)
+{
+    int ret;
+
+    snapshot_bio_wq = alloc_workqueue("snapshot_bio_kp_wq",
+                                      WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+    if (!snapshot_bio_wq) return -ENOMEM;
+
+    ret = register_kprobe(&kp_submit_bio);
+    if (!ret) { pr_info("SNAPSHOT: kprobe submit_bio\n"); return 0; }
+
+    destroy_workqueue(snapshot_bio_wq);
+    snapshot_bio_wq = NULL;
+    pr_err("SNAPSHOT: no submit_bio* symbol hookable (ret=%d)\n", ret);
+    return ret;
+}
+
+void remove_bio_kprobe(void)
+{
+    unregister_kprobe(&kp_submit_bio);
+
+    if (snapshot_bio_wq) {
+        flush_workqueue(snapshot_bio_wq);
+        destroy_workqueue(snapshot_bio_wq);
+        snapshot_bio_wq = NULL;
+    }
+    pr_info("SNAPSHOT: BIO kprobe removed\n");
+}
 
 /**
  * install_read_hook - Install the read event hook

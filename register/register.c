@@ -202,7 +202,7 @@ void handle_mount_event(struct block_device *bd) {
     pr_warn("SNAPSHOT: Mount events not supported for kernel < 5.16\n");
 }
 #else
-void handle_mount_event(struct block_device *bdev) {
+void handle_mount_event(struct block_device *bdev, const char *fs_type) {
     snapshot_device *sdev;
     u64 timestamp;
     int ret;
@@ -234,7 +234,7 @@ void handle_mount_event(struct block_device *bdev) {
     spin_unlock(&sdev->lock);
 
     /* Start a new session */
-    ret = start_session_for_bdev(sdev, bdev, &timestamp);
+    ret = start_session_for_bdev(sdev, bdev, &timestamp, fs_type);
     if (ret) {
         pr_err("SNAPSHOT: Failed to start session: %d\n", ret);
         return;
@@ -253,6 +253,7 @@ void handle_mount_event(struct block_device *bdev) {
 static int mount_bdev_handler(struct kretprobe_instance *kp, struct pt_regs *regs)
 {
     struct dentry *dentry;
+    const char *fs_type;
     void *ret;
     
     /* Get return value (should be dentry) */
@@ -283,9 +284,9 @@ static int mount_bdev_handler(struct kretprobe_instance *kp, struct pt_regs *reg
                 dentry->d_sb->s_type->name,
                 dentry->d_sb->s_bdev->bd_disk->disk_name);
     }
-    
+    fs_type = dentry->d_sb->s_type->name;
     /* Handle the mount event (will queue to workqueue) */
-    handle_mount_event(dentry->d_sb->s_bdev);
+    handle_mount_event(dentry->d_sb->s_bdev, fs_type);
     
     return 0;
 }
@@ -311,13 +312,18 @@ static int get_tree_bdev_entry(struct kretprobe_instance *ri, struct pt_regs *re
 static int get_tree_bdev_ret(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct gt_ctx *c = (struct gt_ctx *)ri->data;
+    const char *fs_type;
     int ret = (int)regs_return_value(regs);
-    pr_info("SNAPSHOT: mount matched");
+    
     /*Obtain s_bdev*/
     if (ret == 0 && c && c->fc && c->fc->root && c->fc->root->d_sb) {
         struct super_block *sb = c->fc->root->d_sb;
+        fs_type = sb->s_type->name;
         if (sb->s_bdev) {
-            handle_mount_event(sb->s_bdev);
+            pr_debug("SNAPSHOT: Mount detected - fs: %s, dev: %s\n",
+                fs_type,
+                sb->s_bdev->bd_disk->disk_name);
+            handle_mount_event(sb->s_bdev, fs_type);
         }
     }
     return 0;

@@ -216,9 +216,11 @@ int init_module(void) {
                 password_digest = NULL;
                 return -1;
         }
-
         printk("%s: Password hash computed successfully with return code: %d\n", MODNAME, ret);
 
+        //To avoid leak of pwd just wipe it from memory
+        memzero_explicit(the_snapshot_secret, strlen(the_snapshot_secret));
+        
         if (the_syscall_table == 0x0){
            printk("%s: cannot manage sys_call_table address set to 0x0\n",MODNAME);
            return -1;

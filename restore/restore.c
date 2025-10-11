@@ -2,9 +2,6 @@
 // Matches the on-disk format written by your kernel module:
 //   blocks.map: repeated records { u64 sector; u32 size; u64 offset } (packed)
 //   blocks.dat: raw block payloads appended; 'offset' indexes into this file.
-//
-// Build: gcc -O2 -Wall -Wextra -o restore restore.c
-// Usage: sudo ./snaprestore /dev/loop21
 
 #define _GNU_SOURCE
 #include <stdio.h>
