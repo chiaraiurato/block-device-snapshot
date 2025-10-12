@@ -1,5 +1,5 @@
 obj-m += the_block-device-snapshot.o
-the_block-device-snapshot-objs += block-device-snapshot.o lib/scth.o utils/auth.o register/register.o snapshot/snapshot.o snapshot/snapshot_bio.o
+the_block-device-snapshot-objs += block-device-snapshot.o lib/scth.o utils/auth.o register/register.o snapshot/snapshot.o
 
 MOUNT_PATH = mount
 USER_APP = user/user.out
@@ -16,16 +16,16 @@ compile:
 	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 	@gcc $(SINGLEFILE_FS_DIR)/singlefilemakefs.c -o singlefilemakefs
 	@make -C /lib/modules/$(shell uname -r)/build M=$(PWD)/singlefile-FS modules
+	mkdir $(MOUNT_PATH)
 	@echo "Compilation completed successfully"
 
 create-singlefilefs:
 	dd bs=4096 count=100 if=/dev/zero of=image
 	./singlefilemakefs image
-	mkdir $(MOUNT_PATH)
 
 create-ext4:
-	dd if=/dev/zero of=ext4.img bs=1M count=100
-	mkfs.ext4 -b 4096 ext4.img
+	dd if=/dev/zero of=ext4 bs=1M count=100
+	mkfs.ext4 -b 4096 ext4
 
 mount:
 	@echo "Mounting modules..."
@@ -73,12 +73,12 @@ mount-fs:
 	sudo mount -o loop -t singlefilefs image ./$(MOUNT_PATH)/
 	@echo "Singlefile-fs mounted successfully"
 
-unmount-fs:
+unmount:
 	sudo umount $(MOUNT_PATH)/ -f
 	@echo "Singlefile-fs unmounted successfully"
 
 mount-ext4:
-	sudo mount -o loop -t ext4 ext4.img ./$(MOUNT_PATH)/
+	sudo mount -o loop -t ext4 ext4 ./$(MOUNT_PATH)/
 
 compile-user:
 	@echo "Compiling user application..."
@@ -95,7 +95,7 @@ compile-restore:
 	@gcc $(RESTORE_SRC) -o $(RESTORE_APP) -Wall -Wextra
 	@echo "Restore application compiled successfully"
 
-clean: unmount clean-compile
+clean: unmount-mod clean-compile
 
 clean-compile:
 	@echo "Cleaning up..."
@@ -109,7 +109,7 @@ clean-fs:
 	@echo "Single file system cleanup completed"
 
 
-unmount:
+unmount-mod:
 	@echo "Unmounting modules..."
 	@-sudo rmmod the_block-device-snapshot 2>/dev/null && echo "block-device-snapshot module unloaded" || echo "block-device-snapshot module not loaded"
 	# @-sudo rmmod the_usctm 2>/dev/null && echo "usctm module unloaded" || echo "usctm module not loaded"

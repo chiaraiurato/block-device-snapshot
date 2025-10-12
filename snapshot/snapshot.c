@@ -991,18 +991,20 @@ static int submit_bio_pre_handler(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
-
 static struct kprobe kp_submit_bio = { 
     .symbol_name = "submit_bio",          
     .pre_handler = submit_bio_pre_handler
 };
 
+/**
+ * install_bio_hook - Install the write event hook and
+ */
 int install_bio_kprobe(void)
 {
     int ret;
 
     snapshot_bio_wq = alloc_workqueue("snapshot_bio_kp_wq",
-                                      WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+        WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
     if (!snapshot_bio_wq) return -ENOMEM;
 
     ret = register_kprobe(&kp_submit_bio);
@@ -1087,7 +1089,7 @@ void remove_unmount_hook(void)
 int snapshot_init(void)
 {
     /* Create workqueue for handling mount events */
-    snapshot_wq = alloc_workqueue("snapshot_wq", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+    snapshot_wq = alloc_workqueue("snapshot_wq", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
     if (!snapshot_wq) {
         pr_err("SNAPSHOT: Failed to create workqueue\n");
         return -ENOMEM;
