@@ -34,7 +34,7 @@ user/user.out
 
 # System files
 singlefilemakefs
-ext4.img
+ext4
 
 # Mount directory
 mount/

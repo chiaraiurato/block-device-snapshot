@@ -19,6 +19,9 @@
 #include <linux/printk.h>
 #include <linux/ratelimit.h>
 #include <linux/bitops.h>
+#include <linux/blk_types.h> 
+#include <linux/mm.h> 
+#include <linux/pagemap.h>
 
 #define COW_SECT_PER_BLK    (COW_BLK_SZ / COW_SECT_SZ)
 #define ALIGN_DOWN_SECT(s)  ((s) & ~((sector_t)COW_SECT_PER_BLK - 1))
@@ -38,6 +41,142 @@ MODULE_PARM_DESC(log_every, "Log only 1 out of N write events");
 
 static atomic64_t snap_evt_count = ATOMIC_INIT(0);
 
+
+static bool snap_trace_stack = false;
+module_param_named(trace_stack, snap_trace_stack, bool, 0644);
+MODULE_PARM_DESC(trace_stack, "Dump a stack trace on submit_bio");
+
+typedef typeof(((struct bio *)0)->bi_opf) snap_opf_t;
+
+static inline struct address_space *snap_page_mapping(struct page *page)
+{
+#ifdef PAGE_MAPPING_FLAGS
+    return (struct address_space *)(
+        (unsigned long)READ_ONCE(page->mapping) & ~PAGE_MAPPING_FLAGS
+    );
+#else
+    return (struct address_space *)READ_ONCE(page->mapping);
+#endif
+}
+
+static const char *snap_op_name(unsigned int op)
+{
+    switch (op) {
+    case REQ_OP_READ:          return "READ";
+    case REQ_OP_WRITE:         return "WRITE";
+    case REQ_OP_FLUSH:         return "FLUSH";
+    case REQ_OP_DISCARD:       return "DISCARD";
+    case REQ_OP_WRITE_ZEROES:  return "WRITE_ZEROES";
+    case REQ_OP_ZONE_APPEND:   return "ZONE_APPEND";
+    case REQ_OP_ZONE_RESET:    return "ZONE_RESET";
+    default:                   return "OP?";
+    }
+}
+
+static void snap_flags_to_str(snap_opf_t opf, char *buf, size_t sz)
+{
+    int n = 0;
+#define ADD(_cond, _name) do { if (_cond) n += scnprintf(buf + n, sz - n, "%s" _name, n ? "|" : ""); } while (0)
+#ifdef REQ_SYNC
+    ADD(opf & REQ_SYNC, "SYNC");
+#endif
+#ifdef REQ_META
+    ADD(opf & REQ_META, "META");
+#endif
+#ifdef REQ_FUA
+    ADD(opf & REQ_FUA, "FUA");
+#endif
+#ifdef REQ_PREFLUSH
+    ADD(opf & REQ_PREFLUSH, "PREFLUSH");
+#endif
+#ifdef REQ_RAHEAD
+    ADD(opf & REQ_RAHEAD, "RAHEAD");
+#endif
+#ifdef REQ_BACKGROUND
+    ADD(opf & REQ_BACKGROUND, "BACKGROUND");
+#endif
+#ifdef REQ_NOWAIT
+    ADD(opf & REQ_NOWAIT, "NOWAIT");
+#endif
+#ifdef REQ_PRIO
+    ADD(opf & REQ_PRIO, "PRIO");
+#endif
+#undef ADD
+    if (n == 0) strscpy(buf, "-", sz);
+}
+
+static struct inode *snap_bio_inode(struct bio *bio)
+{
+    struct bio_vec bvec;
+    struct bvec_iter iter;
+
+    rcu_read_lock();
+    bio_for_each_segment(bvec, bio, iter) {
+        struct page *page = bvec.bv_page;
+        struct address_space *mapping = snap_page_mapping(page);
+        if (!mapping) continue;
+
+        if (READ_ONCE(mapping->host)) {
+            struct inode *inode = mapping->host;
+            rcu_read_unlock();
+            return inode;
+        }
+    }
+    rcu_read_unlock();
+    return NULL;
+}
+
+static void snap_decode_ioprio(u16 ioprio, unsigned int *classp, unsigned int *datap)
+{
+#ifdef IOPRIO_PRIO_CLASS
+    *classp = IOPRIO_PRIO_CLASS(ioprio);
+    *datap  = IOPRIO_PRIO_DATA(ioprio);
+#else
+    *classp = 0; *datap = 0;
+#endif
+}
+static void snap_log_submit_bio(const char *tag, struct bio *bio)
+{
+    const char *disk = (bio->bi_bdev && bio->bi_bdev->bd_disk) ? bio->bi_bdev->bd_disk->disk_name : "?";
+    snap_opf_t opf   = bio->bi_opf;
+    unsigned int op  = bio_op(bio);
+    char flags[96];  flags[0] = '\0';
+    unsigned int iclass = 0, idata = 0;
+    struct inode *inode = snap_bio_inode(bio);
+    unsigned long ino   = inode ? inode->i_ino : 0;
+    const char *fs_id   = (inode && inode->i_sb) ? inode->i_sb->s_id : "-";
+
+#ifdef CONFIG_BLOCK
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
+    u16 ioprio = bio->bi_ioprio;
+#else
+    u16 ioprio = 0;
+#endif
+#else
+    u16 ioprio = 0;
+#endif
+
+    snap_flags_to_str(opf, flags, sizeof(flags));
+    snap_decode_ioprio(ioprio, &iclass, &idata);
+
+    pr_info_ratelimited(
+        "SNAPSHOT:%s dev=%s op=%s flags=%s sector=%llu bytes=%u pid=%d comm=%s ioprio=%u/%u hint=%u inode=%lu fs=%s end_io=%ps\n",
+        tag, disk, snap_op_name(op), flags,
+        (unsigned long long)bio->bi_iter.bi_sector,
+        bio->bi_iter.bi_size,
+        current->pid, current->comm,
+        iclass, idata,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,13,0)
+        bio->bi_write_hint,
+#else
+        0U,
+#endif
+        ino, fs_id, bio->bi_end_io
+    );
+
+    if (snap_trace_stack)
+        dump_stack();
+}
 static void snap_dump_bh(const char *tag, struct buffer_head *bh,
                          sector_t sector_key, bool is_new)
 {
@@ -191,6 +330,7 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp)
     session->timestamp = timestamp;
     session->sdev = sdev;
     session->snapshot_dir[0] = '\0';
+    session->metadata_enabled = false;
     
     mutex_init(&session->dir_mtx);
     xa_init(&session->saved_blocks);
@@ -874,6 +1014,70 @@ static struct kretprobe __bread_gfp_kp = {
     .maxactive = -1, 
 };
 
+static inline bool comm_has_prefix(const char *pfx) {
+    return strncmp(current->comm, pfx, strlen(pfx)) == 0; 
+}
+
+static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
+{
+    struct file *file = (struct file *)regs->di;
+    snapshot_device *sdev;
+    snapshot_session *ses;
+    struct inode *inode;
+    struct super_block *sb;
+
+    /* Only track writes from user-space processes */
+    if (current->flags & PF_KTHREAD) return 0;
+    if (comm_has_prefix("systemd")) return 0;
+
+    if (!file || !file->f_inode) return 0;
+    
+    inode = file->f_inode;
+    sb = inode->i_sb;
+    
+    if (!sb || !sb->s_bdev) return 0;
+
+    /* Find device */
+    sdev = find_device_for_bdev(sb->s_bdev);
+    if (!sdev || !READ_ONCE(sdev->snapshot_active))
+        return 0;
+
+    /* Get active session */
+    ses = get_active_session_rcu(sdev);
+    if (!ses) return 0;
+
+    /* Enable metadata capture for this session */
+    if (!READ_ONCE(ses->metadata_enabled)) {
+        WRITE_ONCE(ses->metadata_enabled, true);
+        pr_info("SNAPSHOT: User write detected from %s (pid=%d), metadata capture ENABLED\n",
+                current->comm, current->pid);
+    }
+    
+    return 0;
+}
+
+static struct kprobe vfs_write_kp = {
+    .symbol_name = "vfs_write",
+    .pre_handler = vfs_write_entry,
+};
+
+int install_vfs_write_hook(void)
+{
+    int ret = register_kprobe(&vfs_write_kp);
+    if (ret < 0) {
+        pr_err("SNAPSHOT: Failed to register kprobe on vfs_write: %d\n", ret);
+        return ret;
+    }
+    pr_info("SNAPSHOT: VFS write hook installed\n");
+    return 0;
+}
+
+void remove_vfs_write_hook(void)
+{
+    unregister_kprobe(&vfs_write_kp);
+    pr_info("SNAPSHOT: VFS write hook removed\n");
+}
+
 static int read_old_block(struct block_device *bdev, sector_t key, void *buf, unsigned int size)
 {
     struct page *page;
@@ -965,14 +1169,26 @@ static void schedule_preimages_for_bio(snapshot_session *ses, struct block_devic
     }
 }
 
+static inline bool is_metadata_or_background(struct bio *bio)
+{
+    /* These are metadata/background writes */
+    if (bio->bi_opf & REQ_META) return true;
+    if (bio->bi_opf & REQ_BACKGROUND) return true;
+    if (comm_has_prefix("kworker/")) return true;
+    if (comm_has_prefix("jbd2/")) return true;
+    return false;
+}
+
 static int submit_bio_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
     struct bio *bio = (struct bio *)regs->di;
     snapshot_device *sdev;
     snapshot_session *ses;
+    bool is_meta_or_bg;
 
     if (!bio || !bio->bi_bdev) return 0;
     if (!op_is_write(bio_op(bio))) return 0; 
+    if (bio->bi_opf & REQ_PREFLUSH) return 0;
 
     sdev = find_device_for_bdev(bio->bi_bdev);
     if (!sdev || !READ_ONCE(sdev->snapshot_active) ||
@@ -982,12 +1198,20 @@ static int submit_bio_pre_handler(struct kprobe *p, struct pt_regs *regs)
     ses = get_active_session_rcu(sdev);
     if (!ses) return 0;
 
-    pr_info_ratelimited("SNAPSHOT: submit_bio WRITE dev=%s secs=%llu len=%u\n",
-        bio->bi_bdev->bd_disk ? bio->bi_bdev->bd_disk->disk_name : "?",
-        (unsigned long long)bio->bi_iter.bi_sector,
-        bio->bi_iter.bi_size);
+    /* Check if user has written something) */
+    if (!READ_ONCE(ses->metadata_enabled)) {
+        if (snap_trace)
+            pr_info("SNAPSHOT: Ignoring write (no user writes yet) from %s\n", 
+                    current->comm);
+        return 0;
+    }
 
+    /* Once enabled, capture bio events */
+    is_meta_or_bg = is_metadata_or_background(bio);
+    
+    snap_log_submit_bio(is_meta_or_bg ? "submit_bio(META/BG)" : "submit_bio(DATA)", bio);
     schedule_preimages_for_bio(ses, bio->bi_bdev, bio);
+    
     return 0;
 }
 
@@ -1015,7 +1239,9 @@ int install_bio_kprobe(void)
     pr_err("SNAPSHOT: no submit_bio* symbol hookable (ret=%d)\n", ret);
     return ret;
 }
-
+/**
+ * remove_bio_kprobe - Remove bio event hook
+ */
 void remove_bio_kprobe(void)
 {
     unregister_kprobe(&kp_submit_bio);

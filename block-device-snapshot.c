@@ -265,6 +265,12 @@ int init_module(void) {
                 return ret;
             }
             printk("%s: BIO kprobe installed\n", MODNAME);
+            ret = install_vfs_write_hook();
+            if (ret < 0){
+                printk("%s: vfs_write kprobe install error\n", MODNAME);
+                return ret;
+            }
+            printk("%s: vfs_write() kprobe installed\n", MODNAME);
         } else {
             ret = install_mount_hook();
             if (ret < 0) {
@@ -305,6 +311,7 @@ void cleanup_module(void) {
         if (use_bio_layer) {
             remove_bio_kprobe();
             remove_get_tree_bdev_hook();
+            remove_vfs_write_hook();
         } else {
             remove_mount_hook();
             remove_write_hook();

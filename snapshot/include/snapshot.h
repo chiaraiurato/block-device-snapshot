@@ -42,6 +42,7 @@ typedef struct {
     struct file *data_file;       
     loff_t map_pos;
     loff_t data_pos;
+    bool metadata_enabled;
 } snapshot_session;
 
 /**
@@ -106,12 +107,6 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp);
 void destroy_session(snapshot_session *session);
 
 
-int queue_cow_for_block(snapshot_session *session,
-    struct block_device *bdev,
-    sector_t blocknr,
-    unsigned int size,
-    sector_t sector_key);
-
 
 static inline snapshot_session *get_active_session_rcu(snapshot_device *sdev)
 {
@@ -143,10 +138,6 @@ static inline void put_session(snapshot_session *ses)
     }
 }
 
-static int enqueue_cow_mem(snapshot_session *session,
-    sector_t sector_key,
-    void *src,
-    unsigned int size);
 /* Workqueue initialization */
 int snapshot_init(void);
 void snapshot_exit(void);
@@ -179,5 +170,11 @@ void remove_unmount_hook(void);
  */
 int install_bio_kprobe(void);
 void remove_bio_kprobe(void);
+
+/**
+ * install_vfs_write_hook - Install the vfs write event hook
+ */
+int install_vfs_write_hook(void);
+void remove_vfs_write_hook(void);
 
 #endif
