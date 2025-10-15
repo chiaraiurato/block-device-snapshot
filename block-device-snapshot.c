@@ -307,7 +307,6 @@ void cleanup_module(void) {
         // snapshot_device *dev, *tmp;
         printk("%s: shutting down\n",MODNAME);
         //remove all hooks
-        // TODO : refactor to remove all hooks in a single function
         if (use_bio_layer) {
             remove_bio_kprobe();
             remove_get_tree_bdev_hook();

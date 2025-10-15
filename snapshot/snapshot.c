@@ -291,11 +291,16 @@ static int snap_rmdir_path(const char *dirpath)
 
 static void cleanup_empty_session(snapshot_session *session)
 {
-    char path[PATH_MAX];
+    char *path;
 
     if (session->data_file) { filp_close(session->data_file, NULL); session->data_file = NULL; }
     if (session->map_file)  { filp_close(session->map_file,  NULL); session->map_file  = NULL; }
 
+    path = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!path) {
+        pr_err("SNAPSHOT: kmalloc(PATH_MAX) failed in cleanup_empty_session\n");
+        return;
+    }
     snprintf(path, PATH_MAX, "%s/blocks.dat", session->snapshot_dir);
     if (snap_unlink_path(path))
         pr_debug("SNAPSHOT: unlink failed : %s\n", path);
@@ -308,10 +313,11 @@ static void cleanup_empty_session(snapshot_session *session)
     if (snap_unlink_path(path))
         pr_debug("SNAPSHOT: unlink failed : %s\n", path);
 
-    /* remove the directory */
+    /* remove finally the directory */
     if (snap_rmdir_path(session->snapshot_dir))
         pr_debug("SNAPSHOT: rmdir failed : %s\n", session->snapshot_dir);
-
+    
+    kfree(path);
     pr_info("SNAPSHOT: Removed empty snapshot dir %s\n", session->snapshot_dir);
 }
 
@@ -382,62 +388,77 @@ void destroy_session(snapshot_session *session)
 /**
  * update_metadata_file - Update meta.json with final statistics
  */
-static int update_metadata_file(snapshot_session *session, const char *raw_devname, const char *fs_type)
+static int update_metadata_file(snapshot_session *session,
+    const char *raw_devname,
+    const char *fs_type)
 {
-    char *pmeta = kmalloc(PATH_MAX, GFP_KERNEL);
-    char meta[1024];
+    char *pmeta = NULL;
+    char *meta  = NULL;
     size_t mlen;
     struct file *mf;
     loff_t pos = 0;
     int ret = 0;
 
+    if (!session || !raw_devname || !fs_type)
+    return -EINVAL;
+
+    pmeta = kmalloc(PATH_MAX, GFP_KERNEL);
     if (!pmeta)
         return -ENOMEM;
 
+    meta = kmalloc(1024, GFP_KERNEL);           
+    if (!meta) { ret = -ENOMEM; goto out_free_pmeta; }
+
     snprintf(pmeta, PATH_MAX, "%s/meta.json", session->snapshot_dir);
 
-
-    /* Generate JSON metadata */
-    mlen = scnprintf(meta, sizeof(meta),
-                     "{\n"
-                     "  \"device\": \"%s\",\n"
-                     "  \"timestamp\": %llu,\n"
-                     "  \"block_size\": %u,\n"
-                     "  \"fs_type\": \"%s\",\n"
-                     "  \"total_blocks_saved\": %lld,\n"
-                     "  \"snapshot_type\": \"COW\"\n"
-                     "}\n",
-                     raw_devname,
-                     session->timestamp,
-                     COW_BLK_SZ,
-                     fs_type,
-                     atomic64_read(&session->blocks_count));
+    mlen = scnprintf(meta, 1024,
+    "{\n"
+    "  \"device\": \"%s\",\n"
+    "  \"timestamp\": %llu,\n"
+    "  \"block_size\": %u,\n"
+    "  \"fs_type\": \"%s\",\n"
+    "  \"total_blocks_saved\": %lld,\n"
+    "  \"snapshot_type\": \"COW\"\n"
+    "}\n",
+    raw_devname,
+    session->timestamp,
+    COW_BLK_SZ,
+    fs_type,
+    atomic64_read(&session->blocks_count));
 
     mf = filp_open(pmeta, O_CREAT|O_WRONLY|O_TRUNC, 0644);
     if (IS_ERR(mf)) {
         ret = PTR_ERR(mf);
         pr_err("SNAPSHOT: Failed to create meta.json: %d\n", ret);
-        goto out;
+        goto out_free_meta;
     }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
-    kernel_write(mf, meta, mlen, &pos);
-#else
+    #if LINUX_VERSION_CODE >= KERNEL_VERSION(5,10,0)
+        ret = kernel_write(mf, meta, mlen, &pos);
+    #else
     {
         mm_segment_t oldfs = get_fs();
         set_fs(KERNEL_DS);
-        vfs_write(mf, meta, mlen, &pos);
+        ret = vfs_write(mf, meta, mlen, &pos);
         set_fs(oldfs);
     }
-#endif
-
+    #endif
     filp_close(mf, NULL);
-    pr_info("SNAPSHOT: Updated %s\n", pmeta);
+    if (ret < 0) {
+        pr_err("SNAPSHOT: write meta.json failed: %d\n", ret);
+        goto out_free_meta;
+    }
 
-out:
+    pr_info("SNAPSHOT: Updated %s\n", pmeta);
+    ret = 0;
+
+out_free_meta:
+    kfree(meta);
+out_free_pmeta:
     kfree(pmeta);
     return ret;
 }
+
 
 /**
  * create_files_and_meta_for_session - Create snapshot files
@@ -673,7 +694,7 @@ int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64
 int stop_sessions_for_bdev(snapshot_device *sdev)
 {
     LIST_HEAD(to_free);
-    snapshot_session *session, *tmp;
+    snapshot_session *session;
     /* Return if there isn't a device attached*/
     if (!sdev || !sdev->bdev)
         return -EINVAL;
@@ -725,7 +746,7 @@ static void cow_mem_worker(struct work_struct *w)
         set_fs(oldfs); 
     }
 #endif
-    pr_info("SNAPSHOT: I'm writing block data");
+    
     if (wrc != mw->size) {
         pr_warn_ratelimited("SNAPSHOT: data write incomplete (%zd/%u)\n", wrc, mw->size);
     }
@@ -1068,14 +1089,12 @@ int install_vfs_write_hook(void)
         pr_err("SNAPSHOT: Failed to register kprobe on vfs_write: %d\n", ret);
         return ret;
     }
-    pr_info("SNAPSHOT: VFS write hook installed\n");
     return 0;
 }
 
 void remove_vfs_write_hook(void)
 {
     unregister_kprobe(&vfs_write_kp);
-    pr_info("SNAPSHOT: VFS write hook removed\n");
 }
 
 static int read_old_block(struct block_device *bdev, sector_t key, void *buf, unsigned int size)

@@ -127,10 +127,115 @@ static void print_table(const session_t *list, size_t n) {
         printf("%3zu | %-25s | %s\n", i+1, list[i].dirname, when);
     }
 }
+// Check if a regular file is the backing file for any active loop device
+static bool is_loop_backing_file_in_use(const char *filepath) {
+    DIR *dir = opendir("/sys/block");
+    if (!dir) return false;
+
+    bool in_use = false;
+    struct dirent *de;
+    
+    while ((de = readdir(dir))) {
+        // Look for loopN directories
+        if (strncmp(de->d_name, "loop", 4) != 0) continue;
+
+        char backing_file_path[PATH_MAX];
+        snprintf(backing_file_path, sizeof(backing_file_path),
+                 "/sys/block/%s/loop/backing_file", de->d_name);
+
+        FILE *fp = fopen(backing_file_path, "r");
+        if (!fp) continue;
+
+        char backing[PATH_MAX];
+        if (fgets(backing, sizeof(backing), fp)) {
+            // Remove trailing newline
+            size_t len = strlen(backing);
+            if (len > 0 && backing[len-1] == '\n') {
+                backing[len-1] = '\0';
+            }
+
+            // Compare paths
+            if (strcmp(backing, filepath) == 0) {
+                in_use = true;
+                fclose(fp);
+                break;
+            }
+        }
+        fclose(fp);
+    }
+
+    closedir(dir);
+    return in_use;
+}
 
 static bool is_device_mounted(const char *devname) {
-    //TODO: implement the control
+    struct stat target_st;
+    if (stat(devname, &target_st) != 0) {
+        perror("stat(devname)");
+        return false; // If we can't stat it, allow restore attempt
+    }
+
+    bool is_block = S_ISBLK(target_st.st_mode);
+    bool is_regular = S_ISREG(target_st.st_mode);
+
+    if (!is_block && !is_regular) {
+        fprintf(stderr, "Warning: '%s' is neither a block device nor regular file\n", devname);
+        return false;
+    }
+
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (!fp) {
+        perror("fopen(/proc/mounts)");
+        return false;
+    }
+
+    char line[PATH_MAX * 2];
+    char real_devname[PATH_MAX];
+    bool mounted = false;
+
+    // Resolve symlinks for target
+    if (realpath(devname, real_devname) == NULL) {
+        strncpy(real_devname, devname, sizeof(real_devname) - 1);
+        real_devname[PATH_MAX - 1] = '\0';
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        char mount_dev[PATH_MAX];
+        if (sscanf(line, "%s", mount_dev) != 1) continue;
+
+        // For block devices: compare device numbers
+        if (is_block) {
+            struct stat mount_st;
+            if (stat(mount_dev, &mount_st) == 0 && S_ISBLK(mount_st.st_mode)) {
+                if (mount_st.st_rdev == target_st.st_rdev) {
+                    mounted = true;
+                    break;
+                }
+            }
+        }
+
+        // For regular files (loop backing files): compare resolved paths
+        if (is_regular) {
+            char real_mount[PATH_MAX];
+            if (realpath(mount_dev, real_mount) != NULL) {
+                if (strcmp(real_mount, real_devname) == 0) {
+                    mounted = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fclose(fp);
+
+    // Additional check for regular files: check if used by any loop device
+    if (!mounted && is_regular) {
+        mounted = is_loop_backing_file_in_use(real_devname);
+    }
+
+    return mounted;
 }
+
 
 static int restore_from_dir(const char *devname, const char *session_dir) {
     char path_map[PATH_MAX], path_dat[PATH_MAX];
@@ -144,8 +249,10 @@ static int restore_from_dir(const char *devname, const char *session_dir) {
 
     int fd_target = -1;
     if (strncmp(devname, "/dev/", 5) == 0) {
+        //Real block device
         fd_target = open(devname, O_RDWR | O_SYNC);
     } else {
+        //Regular files mounted as loop device
         fd_target = open(devname, O_WRONLY | O_SYNC);
     }
     if (fd_target < 0) {
@@ -223,8 +330,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Error: '%s' not found \n", SNAPSHOT_ROOT);
         return 1;
     }
-    
-    if (is_device_mounted(devname)) {
+    bool mounted = is_device_mounted(devname);
+    if (mounted) {
         fprintf(stderr, "Refusing to restore: device appears mounted (%s).\n", devname);
         fprintf(stderr, "Please unmount it first.\n");
         return 1;
