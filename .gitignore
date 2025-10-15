@@ -31,6 +31,8 @@ image
 
 # User binaries
 user/user.out
+test/attack.out
+restore/restore.out
 
 # System files
 singlefilemakefs

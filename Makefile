@@ -7,6 +7,8 @@ USER_SRC = user/user.c
 RESTORE_APP = restore/restore.out
 RESTORE_SRC = restore/restore.c
 SINGLEFILE_FS_DIR = singlefile-FS
+ATTACK_APP = test/attack.out
+ATTACK_SRC = test/attack.c
 
 all: compile mount compile-user 
 
@@ -95,6 +97,30 @@ compile-restore:
 	@gcc $(RESTORE_SRC) -o $(RESTORE_APP) -Wall -Wextra
 	@echo "Restore application compiled successfully"
 
+compile-attack:
+	@gcc $(ATTACK_SRC) -o $(ATTACK_APP) -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64
+	@echo "Attack application compiled successfully"
+
+write-file:
+	@set -euo pipefail; \
+	: $${FILE:?Usage: make write-file FILE=<name> [TEXT=...] [BLOCK_SIZE=4096] [N=8] [JITTER=123]}; \
+	OUT="$(MOUNT_PATH)/$$FILE"; \
+	TEXT="$${TEXT:-SUPERSECRETPASS}"; \
+	BLOCK_SIZE="$${BLOCK_SIZE:-4096}"; \
+	N="$${N:-8}"; \
+	JITTER="$${JITTER:-123}"; \
+	echo "[write-file] -> $$OUT  (N=$$N, BS=$$BLOCK_SIZE, jitter=$$JITTER)"; \
+	sudo install -d -m 0755 "$(MOUNT_PATH)"; \
+	: | sudo tee "$$OUT" >/dev/null; \
+	for i in $$(seq 0 $$((N-1))); do \
+	  off=$$(( i*BLOCK_SIZE + ( (i%2==1) ? JITTER : 0 ) )); \
+	  echo "  + write at +$$off"; \
+	  sudo bash -c 'printf "%s" "$$0" | dd of="$$1" bs=1 seek="$$2" conv=notrunc status=none' "$$TEXT" "$$OUT" "$$off"; \
+	done; \
+	sync; \
+	ls -l "$$OUT"
+
+
 clean: unmount-mod clean-compile
 
 clean-compile:
@@ -118,4 +144,25 @@ unmount-mod:
 rmmod-fs:
 	@-sudo rmmod singlefilefs
 	@echo "Unmounted single file system"
-.PHONY: all compile mount clean clean-compile unmount
+
+activate-ext4: compile-user
+	@set -euo pipefail; \
+	LOOP=$$($(MAKE) -s print-loop); \
+	if [ -z "$$LOOP" ]; then echo "No loop device find for ./ext4 (mount it before ext4)"; exit 1; fi; \
+	PASS=$$(tr -d '\n' < ./s3cr3t); \
+	echo "[activate] device=$$LOOP"; \
+	sudo $(USER_APP) activate "$$LOOP" "$$PASS"
+
+deactivate-ext4: compile-user
+	@set -euo pipefail; \
+	LOOP=$$($(MAKE) -s print-loop); \
+	if [ -z "$$LOOP" ]; then echo "No loop device find for ./ext4"; exit 1; fi; \
+	PASS=$$(tr -d '\n' < ./s3cr3t); \
+	echo "[deactivate] device=$$LOOP"; \
+	sudo $(USER_APP) deactivate "$$LOOP" "$$PASS"
+
+.PHONY: all compile mount create-singlefilefs create-ext4 \
+        load-fs mount-fs unmount mount-ext4 \
+        compile-user compile-restore compile-attack \
+        clean clean-compile clean-fs unmount-mod rmmod-fs \
+        print-loop activate-ext4 deactivate-ext4
