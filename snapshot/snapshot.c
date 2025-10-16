@@ -27,24 +27,12 @@
 #define ALIGN_DOWN_SECT(s)  ((s) & ~((sector_t)COW_SECT_PER_BLK - 1))
 #define ALIGN_UP_SECT(s)    (((s) + COW_SECT_PER_BLK - 1) & ~((sector_t)COW_SECT_PER_BLK - 1))
 
-static bool snap_trace = true;             /* master on/off */
-module_param_named(trace, snap_trace, bool, 0644);
-MODULE_PARM_DESC(trace, "Enable verbose snapshot tracing");
-
+static bool snap_trace = true;             /* on/off trace for buffer cache*/
+static bool snap_trace_bio = false;        /* on/off trace for bio*/
 static int snap_dump_bytes = 64;           /* hexdump N bytes (0 = off) */
-module_param_named(dump_bytes, snap_dump_bytes, int, 0644);
-MODULE_PARM_DESC(dump_bytes, "Number of bytes to hex dump per block");
-
 static unsigned int snap_log_every = 1;    /* log 1 of every N events */
-module_param_named(log_every, snap_log_every, uint, 0644);
-MODULE_PARM_DESC(log_every, "Log only 1 out of N write events");
 
 static atomic64_t snap_evt_count = ATOMIC_INIT(0);
-
-
-static bool snap_trace_stack = false;
-module_param_named(trace_stack, snap_trace_stack, bool, 0644);
-MODULE_PARM_DESC(trace_stack, "Dump a stack trace on submit_bio");
 
 typedef typeof(((struct bio *)0)->bi_opf) snap_opf_t;
 
@@ -174,9 +162,10 @@ static void snap_log_submit_bio(const char *tag, struct bio *bio)
         ino, fs_id, bio->bi_end_io
     );
 
-    if (snap_trace_stack)
+    if (snap_trace_bio)
         dump_stack();
 }
+
 static void snap_dump_bh(const char *tag, struct buffer_head *bh,
                          sector_t sector_key, bool is_new)
 {
@@ -858,7 +847,7 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
         return 0;
     }
 
-    snap_dump_bh("WRITE_CONFIRMED", bh, key, true);
+    //snap_dump_bh("WRITE_CONFIRMED", bh, key, true);
     /*Take old data and replace data with a sentinel*/
     void *prev = xa_store(&ses->pending_block, key, xa_mk_value(1), GFP_ATOMIC);
     if (xa_err(prev)) {
@@ -1228,7 +1217,7 @@ static int submit_bio_pre_handler(struct kprobe *p, struct pt_regs *regs)
     /* Once enabled, capture bio events */
     is_meta_or_bg = is_metadata_or_background(bio);
     
-    snap_log_submit_bio(is_meta_or_bg ? "submit_bio(META/BG)" : "submit_bio(DATA)", bio);
+    //snap_log_submit_bio(is_meta_or_bg ? "submit_bio(META/BG)" : "submit_bio(DATA)", bio);
     schedule_preimages_for_bio(ses, bio->bi_bdev, bio);
     
     return 0;
