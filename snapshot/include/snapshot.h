@@ -113,7 +113,6 @@ static inline snapshot_session *get_active_session_rcu(snapshot_device *sdev)
     snapshot_session *session;
     rcu_read_lock();
     session = rcu_dereference(sdev->active_session);
-    if (session)
     rcu_read_unlock();
     return session;
 }
@@ -130,7 +129,6 @@ static inline void put_session(snapshot_session *ses)
     if (!ses) return;
 
     if (atomic_dec_and_test(&ses->ref_count)) {
-        pr_info("SNAPSHOT: put_session: DESTROYING session %llu\n", ses->timestamp);
         destroy_session(ses); 
     } else {
         pr_debug("SNAPSHOT: put_session: session %llu refcount is now %d\n", 

@@ -9,6 +9,7 @@ RESTORE_SRC = restore/restore.c
 SINGLEFILE_FS_DIR = singlefile-FS
 ATTACK_APP = test/attack.out
 ATTACK_SRC = test/attack.c
+TEST_DIR = test/example_files
 
 all: compile mount compile-user 
 
@@ -65,7 +66,7 @@ mount:
 	echo "[mount] loading the_block-device-snapshot.ko"; \
 	sudo insmod the_block-device-snapshot.ko \
 		the_syscall_table=$$SYS_CALL_TABLE \
-		the_snapshot_secret=$$SECR3T_VAL use_bio_layer=1 || { echo "ERROR: failed to load snapshot"; exit 1; }
+		the_snapshot_secret=$$SECR3T_VAL use_bio_layer=0 || { echo "ERROR: failed to load snapshot"; exit 1; }
 
 load-fs:
 	sudo insmod $(SINGLEFILE_FS_DIR)/singlefilefs.ko
@@ -101,24 +102,30 @@ compile-attack:
 	@gcc $(ATTACK_SRC) -o $(ATTACK_APP) -O2 -Wall -Wextra -D_FILE_OFFSET_BITS=64
 	@echo "Attack application compiled successfully"
 
-write-file:
-	@set -euo pipefail; \
-	: $${FILE:?Usage: make write-file FILE=<name> [TEXT=...] [BLOCK_SIZE=4096] [N=8] [JITTER=123]}; \
-	OUT="$(MOUNT_PATH)/$$FILE"; \
-	TEXT="$${TEXT:-SUPERSECRETPASS}"; \
-	BLOCK_SIZE="$${BLOCK_SIZE:-4096}"; \
-	N="$${N:-8}"; \
-	JITTER="$${JITTER:-123}"; \
-	echo "[write-file] -> $$OUT  (N=$$N, BS=$$BLOCK_SIZE, jitter=$$JITTER)"; \
-	sudo install -d -m 0755 "$(MOUNT_PATH)"; \
-	: | sudo tee "$$OUT" >/dev/null; \
-	for i in $$(seq 0 $$((N-1))); do \
-	  off=$$(( i*BLOCK_SIZE + ( (i%2==1) ? JITTER : 0 ) )); \
-	  echo "  + write at +$$off"; \
-	  sudo bash -c 'printf "%s" "$$0" | dd of="$$1" bs=1 seek="$$2" conv=notrunc status=none' "$$TEXT" "$$OUT" "$$off"; \
-	done; \
-	sync; \
-	ls -l "$$OUT"
+setup-test-files:
+	@echo "Copying test files to mount point"
+	@sudo cp -v "$(TEST_DIR)"/* "$(MOUNT_PATH)/"
+	@sudo chmod 644 "$(MOUNT_PATH)"/*
+	@echo ""
+	@echo "Files ready in $(MOUNT_PATH)"
+	@sudo ls -lh "$(MOUNT_PATH)"
+
+ransom-attack:
+	@echo "Executing ransomware attack"
+	@if [ ! -f ./$(ATTACK_APP) ]; then \
+		echo "Error: compile first with 'make compile-attack'"; \
+		exit 1; \
+	fi
+	@echo "Encrypting all files in $(MOUNT_PATH)..."
+	@for file in $(MOUNT_PATH)/*; do \
+		if [ -f "$$file" ]; then \
+			echo "  [ENCRYPT] $$file"; \
+			sudo ./$(ATTACK_APP) "$$file"; \
+		fi \
+	done
+	@echo ""
+	@echo "Attack completed"
+	@sudo ls -lh "$(MOUNT_PATH)"
 
 
 clean: unmount-mod clean-compile
@@ -145,24 +152,9 @@ rmmod-fs:
 	@-sudo rmmod singlefilefs
 	@echo "Unmounted single file system"
 
-activate-ext4: compile-user
-	@set -euo pipefail; \
-	LOOP=$$($(MAKE) -s print-loop); \
-	if [ -z "$$LOOP" ]; then echo "No loop device find for ./ext4 (mount it before ext4)"; exit 1; fi; \
-	PASS=$$(tr -d '\n' < ./s3cr3t); \
-	echo "[activate] device=$$LOOP"; \
-	sudo $(USER_APP) activate "$$LOOP" "$$PASS"
-
-deactivate-ext4: compile-user
-	@set -euo pipefail; \
-	LOOP=$$($(MAKE) -s print-loop); \
-	if [ -z "$$LOOP" ]; then echo "No loop device find for ./ext4"; exit 1; fi; \
-	PASS=$$(tr -d '\n' < ./s3cr3t); \
-	echo "[deactivate] device=$$LOOP"; \
-	sudo $(USER_APP) deactivate "$$LOOP" "$$PASS"
 
 .PHONY: all compile mount create-singlefilefs create-ext4 \
         load-fs mount-fs unmount mount-ext4 \
         compile-user compile-restore compile-attack \
         clean clean-compile clean-fs unmount-mod rmmod-fs \
-        print-loop activate-ext4 deactivate-ext4
+		setup-test-files ransom-attack

@@ -57,9 +57,10 @@ Compile the kernel module and load all modules using the script sh:
 ```bash
 ./install.sh
 ```
+If you want to test bio layer hooking just set **use_bio_layer=1** in the Makefile.
 
 This command will:
-*   Compile the `the_usctm` helper module.
+*   Compile the `the_usctm` module.
 *   Compile the main `block-device-snapshot.ko` module.
 *   Compile the `user` and `restore` command-line tools.
 

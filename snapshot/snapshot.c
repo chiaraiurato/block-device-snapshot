@@ -219,8 +219,7 @@ struct cow_mem_work {
     void *data;               
 };
 
-// TODO: Refactor this struct 
-struct preimage_work { 
+struct cow_mem_work_bio { 
     struct work_struct work; 
     snapshot_session *ses; 
     struct block_device *bdev; 
@@ -278,6 +277,9 @@ static int snap_rmdir_path(const char *dirpath)
     return err;
 }
 
+/**
+ * cleanup_empty_session - If no write occur to mounted device, then we can clean the directory
+ */
 static void cleanup_empty_session(snapshot_session *session)
 {
     char *path;
@@ -575,7 +577,6 @@ static int create_snapshot_subdirectory(snapshot_session *session,
     err = create_files_and_meta_for_session(session, raw_devname, fs_type);
     if (err) {
         pr_err("SNAPSHOT: creation/open files/meta failed: %d\n", err);
-        return err;
     }
     done_path_create(&parent_path, dentry);
     kfree(path);
@@ -704,6 +705,8 @@ int stop_sessions_for_bdev(snapshot_device *sdev)
     list_del_init(&session->list);
     spin_unlock(&sdev->lock);
 
+    /* Wait all RCU readers before destroying session */
+    synchronize_rcu();
 
     /* Do not destroy session here, we must let finish our workers*/
     //release the main ref that was added when the session was created
@@ -876,7 +879,11 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
 
 
 
-struct bread_ctx { struct block_device *bdev; sector_t block; unsigned int size; };
+struct bread_ctx { 
+    struct block_device *bdev; 
+    sector_t block; 
+    unsigned int size; 
+};
 
 static int bread_entry(struct kretprobe_instance *ri, struct pt_regs *regs) {
 #if defined(CONFIG_X86_64)
@@ -917,7 +924,7 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     /* Calculate sector key (512B units) */
     key = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
 
-    snap_dump_bh("COW_CAPTURE", bh, key, false);
+    //snap_dump_bh("COW_CAPTURE", bh, key, false);
 
     if (xa_load(&ses->saved_blocks, key) || xa_load(&ses->pending_block, key)) {
         return 0;
@@ -1027,7 +1034,9 @@ static struct kretprobe __bread_gfp_kp = {
 static inline bool comm_has_prefix(const char *pfx) {
     return strncmp(current->comm, pfx, strlen(pfx)) == 0; 
 }
-
+/**
+ * vfs_write_entry - Pre-handler for vfs_write
+ */
 static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
 {
     struct file *file = (struct file *)regs->di;
@@ -1070,7 +1079,9 @@ static struct kprobe vfs_write_kp = {
     .symbol_name = "vfs_write",
     .pre_handler = vfs_write_entry,
 };
-
+/**
+ * install_vfs_write_hook - Install the write event hook
+ */
 int install_vfs_write_hook(void)
 {
     int ret = register_kprobe(&vfs_write_kp);
@@ -1080,12 +1091,21 @@ int install_vfs_write_hook(void)
     }
     return 0;
 }
-
+/**
+ * remove_vfs_write_hook - Remove the write event hook
+ */
 void remove_vfs_write_hook(void)
 {
     unregister_kprobe(&vfs_write_kp);
 }
 
+
+/**
+ * read_old_block - Read from bio the old block
+ * NB: This mechanism is a best effort COW. It suffers from a race condition because we perform asynchronous reading, 
+ * and if submit_bio is fast, we may store the new block instead of the old one. A better solution would be to use a 
+ * device mapper so that if we intercept a write, we block until the entire bio is read, then we can deliver the block.
+ */
 static int read_old_block(struct block_device *bdev, sector_t key, void *buf, unsigned int size)
 {
     struct page *page;
@@ -1102,6 +1122,7 @@ static int read_old_block(struct block_device *bdev, sector_t key, void *buf, un
     if (!bio) return -ENOMEM;
 
     bio->bi_iter.bi_sector = key;
+    bio->bi_opf = REQ_OP_READ | REQ_SYNC | REQ_PRIO;
 
     page = alloc_page(GFP_KERNEL);
     if (!page) { bio_put(bio); return -ENOMEM; }
@@ -1124,9 +1145,9 @@ static int read_old_block(struct block_device *bdev, sector_t key, void *buf, un
     return ret;
 }
 
-static void preimage_worker(struct work_struct *w)
+static void cow_mem_bio_worker(struct work_struct *w)
 {
-    struct preimage_work *pw = container_of(w, struct preimage_work, work);
+    struct cow_mem_work_bio *pw = container_of(w, struct cow_mem_work_bio, work);
     snapshot_session *ses = pw->ses;
     void *copy = NULL;
 
@@ -1151,7 +1172,7 @@ out_put:
     kfree(pw);
 }
 
-static void schedule_preimages_for_bio(snapshot_session *ses, struct block_device *bdev, struct bio *bio)
+static void schedule_cow_mem_for_bio(snapshot_session *ses, struct block_device *bdev, struct bio *bio)
 {
     sector_t first = bio->bi_iter.bi_sector;
     unsigned int bytes = bio->bi_iter.bi_size;
@@ -1159,7 +1180,7 @@ static void schedule_preimages_for_bio(snapshot_session *ses, struct block_devic
     sector_t end   = ALIGN_UP_SECT(first + (bytes >> 9));
 
     for (sector_t key = start; key < end; key += COW_SECT_PER_BLK) {
-        struct preimage_work *pw;
+        struct cow_mem_work_bio *pw;
 
         if (xa_load(&ses->saved_blocks, key)) continue;
         if (xa_load(&ses->pending_block, key)) continue;
@@ -1167,7 +1188,7 @@ static void schedule_preimages_for_bio(snapshot_session *ses, struct block_devic
         pw = kzalloc(sizeof(*pw), GFP_ATOMIC);
         if (!pw) break;
 
-        INIT_WORK(&pw->work, preimage_worker);
+        INIT_WORK(&pw->work, cow_mem_bio_worker);
         pw->ses  = get_session(ses);
         pw->bdev = bdev;
         pw->key  = key;
@@ -1177,17 +1198,11 @@ static void schedule_preimages_for_bio(snapshot_session *ses, struct block_devic
     }
 }
 
-static inline bool is_metadata_or_background(struct bio *bio)
-{
-    /* These are metadata/background writes */
-    if (bio->bi_opf & REQ_META) return true;
-    if (bio->bi_opf & REQ_BACKGROUND) return true;
-    if (comm_has_prefix("kworker/")) return true;
-    if (comm_has_prefix("jbd2/")) return true;
-    return false;
-}
 
-static int submit_bio_pre_handler(struct kprobe *p, struct pt_regs *regs)
+/**
+ * submit_bio_prehandler - Handler for hook 'submit_bio'
+ */
+static int submit_bio_entry(struct kprobe *p, struct pt_regs *regs)
 {
     struct bio *bio = (struct bio *)regs->di;
     snapshot_device *sdev;
@@ -1213,19 +1228,15 @@ static int submit_bio_pre_handler(struct kprobe *p, struct pt_regs *regs)
                     current->comm);
         return 0;
     }
-
-    /* Once enabled, capture bio events */
-    is_meta_or_bg = is_metadata_or_background(bio);
     
     //snap_log_submit_bio(is_meta_or_bg ? "submit_bio(META/BG)" : "submit_bio(DATA)", bio);
-    schedule_preimages_for_bio(ses, bio->bi_bdev, bio);
-    
+    schedule_cow_mem_for_bio(ses, bio->bi_bdev, bio);
     return 0;
 }
 
 static struct kprobe kp_submit_bio = { 
     .symbol_name = "submit_bio",          
-    .pre_handler = submit_bio_pre_handler
+    .pre_handler = submit_bio_entry
 };
 
 /**
