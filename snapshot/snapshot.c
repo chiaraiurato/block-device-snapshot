@@ -27,6 +27,20 @@
 #define ALIGN_DOWN_SECT(s)  ((s) & ~((sector_t)COW_SECT_PER_BLK - 1))
 #define ALIGN_UP_SECT(s)    (((s) + COW_SECT_PER_BLK - 1) & ~((sector_t)COW_SECT_PER_BLK - 1))
 
+DEFINE_PER_CPU(unsigned long, BRUTE_START);//redundant you might use the below per-cpu variable to setup the initial search address
+DEFINE_PER_CPU(unsigned long *, kprobe_context_pointer);//this is used for steady state operations 
+static struct kprobe setup_probe;
+
+struct kprobe *the_probe = &setup_probe;
+
+static atomic_t successful_search_counter = ATOMIC_INIT(0); //number of CPUs that succesfully found the address of the per-CPU variable that keeps the reference to the current kprobe context 
+unsigned long *reference_offset = 0x0;
+
+void run_on_cpu(void *x) { //this is here just to enable a kprobe on it 
+    pr_info("SNAPSHOT: block device snapshot setup - running on CPU %d\n", smp_processor_id()); 
+}
+
+
 static bool snap_trace = true;             /* on/off trace for buffer cache*/
 static bool snap_trace_bio = false;        /* on/off trace for bio*/
 static int snap_dump_bytes = 64;           /* hexdump N bytes (0 = off) */
@@ -327,7 +341,6 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp)
     session->timestamp = timestamp;
     session->sdev = sdev;
     session->snapshot_dir[0] = '\0';
-    session->metadata_enabled = false;
     
     mutex_init(&session->dir_mtx);
     xa_init(&session->saved_blocks);
@@ -1031,80 +1044,8 @@ static struct kretprobe __bread_gfp_kp = {
     .maxactive = -1, 
 };
 
-static inline bool comm_has_prefix(const char *pfx) {
-    return strncmp(current->comm, pfx, strlen(pfx)) == 0; 
-}
-/**
- * vfs_write_entry - Pre-handler for vfs_write
- */
-static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
-{
-    struct file *file = (struct file *)regs->di;
-    snapshot_device *sdev;
-    snapshot_session *ses;
-    struct inode *inode;
-    struct super_block *sb;
-
-    /* Only track writes from user-space processes */
-    if (current->flags & PF_KTHREAD) return 0;
-    if (comm_has_prefix("systemd")) return 0;
-
-    if (!file || !file->f_inode) return 0;
-    
-    inode = file->f_inode;
-    sb = inode->i_sb;
-    
-    if (!sb || !sb->s_bdev) return 0;
-
-    /* Find device */
-    sdev = find_device_for_bdev(sb->s_bdev);
-    if (!sdev || !READ_ONCE(sdev->snapshot_active))
-        return 0;
-
-    /* Get active session */
-    ses = get_active_session_rcu(sdev);
-    if (!ses) return 0;
-
-    /* Enable metadata capture for this session */
-    if (!READ_ONCE(ses->metadata_enabled)) {
-        WRITE_ONCE(ses->metadata_enabled, true);
-        pr_info("SNAPSHOT: User write detected from %s (pid=%d), metadata capture ENABLED\n",
-                current->comm, current->pid);
-    }
-    
-    return 0;
-}
-
-static struct kprobe vfs_write_kp = {
-    .symbol_name = "vfs_write",
-    .pre_handler = vfs_write_entry,
-};
-/**
- * install_vfs_write_hook - Install the write event hook
- */
-int install_vfs_write_hook(void)
-{
-    int ret = register_kprobe(&vfs_write_kp);
-    if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to register kprobe on vfs_write: %d\n", ret);
-        return ret;
-    }
-    return 0;
-}
-/**
- * remove_vfs_write_hook - Remove the write event hook
- */
-void remove_vfs_write_hook(void)
-{
-    unregister_kprobe(&vfs_write_kp);
-}
-
-
 /**
  * read_old_block - Read from bio the old block
- * NB: This mechanism is a best effort COW. It suffers from a race condition because we perform asynchronous reading, 
- * and if submit_bio is fast, we may store the new block instead of the old one. A better solution would be to use a 
- * device mapper so that if we intercept a write, we block until the entire bio is read, then we can deliver the block.
  */
 static int read_old_block(struct block_device *bdev, sector_t key, void *buf, unsigned int size)
 {
@@ -1122,7 +1063,7 @@ static int read_old_block(struct block_device *bdev, sector_t key, void *buf, un
     if (!bio) return -ENOMEM;
 
     bio->bi_iter.bi_sector = key;
-    bio->bi_opf = REQ_OP_READ | REQ_SYNC | REQ_PRIO;
+    bio->bi_opf = REQ_OP_READ | REQ_SYNC;
 
     page = alloc_page(GFP_KERNEL);
     if (!page) { bio_put(bio); return -ENOMEM; }
@@ -1145,132 +1086,262 @@ static int read_old_block(struct block_device *bdev, sector_t key, void *buf, un
     return ret;
 }
 
-static void cow_mem_bio_worker(struct work_struct *w)
+static sector_t inode_bmap_block(struct inode *inode, sector_t lblock)
 {
-    struct cow_mem_work_bio *pw = container_of(w, struct cow_mem_work_bio, work);
-    snapshot_session *ses = pw->ses;
-    void *copy = NULL;
-
-    /* Same logic as buffer cache */
-    if (xa_load(&ses->saved_blocks, pw->key)) goto out_put;
-    if (xa_insert(&ses->pending_block, pw->key, xa_mk_value(1), GFP_KERNEL)) goto out_put;
-
-    copy = kmalloc(pw->size, GFP_KERNEL);
-    if (!copy) goto out_clear;
-
-    if (!read_old_block(pw->bdev, pw->key, copy, pw->size)) {
-        int ret = enqueue_cow_mem(ses, pw->key, copy, pw->size);
-        if (ret <= 0) kfree(copy);  
-    } else {
-        kfree(copy);
-    }
-
-out_clear:
-    xa_erase(&ses->pending_block, pw->key);
-out_put:
-    put_session(ses);
-    kfree(pw);
-}
-
-static void schedule_cow_mem_for_bio(snapshot_session *ses, struct block_device *bdev, struct bio *bio)
-{
-    sector_t first = bio->bi_iter.bi_sector;
-    unsigned int bytes = bio->bi_iter.bi_size;
-    sector_t start = ALIGN_DOWN_SECT(first);
-    sector_t end   = ALIGN_UP_SECT(first + (bytes >> 9));
-
-    for (sector_t key = start; key < end; key += COW_SECT_PER_BLK) {
-        struct cow_mem_work_bio *pw;
-
-        if (xa_load(&ses->saved_blocks, key)) continue;
-        if (xa_load(&ses->pending_block, key)) continue;
-
-        pw = kzalloc(sizeof(*pw), GFP_ATOMIC);
-        if (!pw) break;
-
-        INIT_WORK(&pw->work, cow_mem_bio_worker);
-        pw->ses  = get_session(ses);
-        pw->bdev = bdev;
-        pw->key  = key;
-        pw->size = COW_BLK_SZ;
-
-        queue_work(snapshot_bio_wq, &pw->work);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
+    if (inode->i_mapping && inode->i_mapping->a_ops && inode->i_mapping->a_ops->bmap)
+        /* bmap(mapping, lblock) : pblock (sector_t) */
+        return inode->i_mapping->a_ops->bmap(inode->i_mapping, lblock);
+#endif
+    /* bmap(inode, sector_t *), 0 = success */
+    {
+        sector_t pblock = lblock;
+        if (bmap(inode, &pblock) == 0)
+            return pblock; 
+        return 0;     
     }
 }
 
+static int cow_schedule(struct file *file,
+                                 loff_t start, size_t count,
+                                 snapshot_session *ses)
+{
+    struct inode *inode = file->f_inode;
+    struct super_block *sb = inode->i_sb;
+    unsigned int blksize      = sb->s_blocksize;
+    unsigned int blksize_bits = sb->s_blocksize_bits;
+    loff_t end = start + count - 1;
+    sector_t lfirst = (sector_t)(start >> blksize_bits);
+    sector_t llast  = (sector_t)(end   >> blksize_bits);
+    int scheduled = 0;
 
+    for (sector_t l = lfirst; l <= llast; ++l) {
+        sector_t pblock = inode_bmap_block(inode, l);
+        sector_t key;
+        void *ptr;
+
+        if (!pblock)
+            continue;
+
+        key = (sector_t)pblock * (blksize >> 9);
+
+        ptr = xa_store(&ses->pending_block, key, xa_mk_value(1), GFP_ATOMIC);
+        if (!ptr || xa_is_value(ptr))
+            continue;
+
+        if (enqueue_cow_mem(ses, key, ptr, blksize) <= 0) {
+            kfree(ptr);
+            xa_erase(&ses->pending_block, key);
+        } else {
+            scheduled++;
+        }
+    }
+    return scheduled;
+}
+
+/* cow_capture */
+static int cow_capture(struct file *file,
+                            loff_t start, size_t count,
+                            snapshot_session *ses)
+{
+    struct inode *inode = file->f_inode;
+    struct super_block *sb = inode->i_sb;
+    struct block_device *bdev = sb ? sb->s_bdev : NULL;
+    unsigned int blksize, blksize_bits;
+    loff_t end;
+    sector_t lfirst, llast, l;
+    int captured = 0;
+
+    if (!sb || !bdev || count == 0)
+        return 0;
+
+    blksize      = sb->s_blocksize;
+    blksize_bits = sb->s_blocksize_bits;
+
+    if (blksize > PAGE_SIZE){
+        pr_info("SNAPSHOT: Block size > Page Size. Not implemented");
+        return 0;
+    }
+        
+
+    end    = start + count - 1;
+    lfirst = (sector_t)(start >> blksize_bits);
+    llast  = (sector_t)(end   >> blksize_bits);
+
+    for (l = lfirst; l <= llast; ++l) {
+        sector_t pblock = inode_bmap_block(inode, l);
+        sector_t key;
+        void *copy;
+
+        if (!pblock)
+            continue;
+
+        key = (sector_t)pblock * (blksize >> 9);
+
+        if (xa_load(&ses->saved_blocks, key) ||
+            xa_load(&ses->pending_block, key))
+            continue;
+
+        if (xa_insert(&ses->pending_block, key, xa_mk_value(1), GFP_ATOMIC))
+            continue;
+
+        copy = kmalloc(blksize, GFP_KERNEL);
+        if (!copy) {
+            xa_erase(&ses->pending_block, key);
+            continue;
+        }
+
+        if (read_old_block(bdev, key, copy, blksize) == 0) {
+            (void)xa_store(&ses->pending_block, key, copy, GFP_KERNEL);
+            captured++;
+        } else {
+            kfree(copy);
+            xa_erase(&ses->pending_block, key);
+        }
+    }
+    return captured;
+}
 /**
- * submit_bio_prehandler - Handler for hook 'submit_bio'
+ * vfs_write_entry - Pre-handler for vfs_write
  */
-static int submit_bio_entry(struct kprobe *p, struct pt_regs *regs)
+static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
 {
-    struct bio *bio = (struct bio *)regs->di;
+    struct file *file = (struct file *)regs->di;
+    size_t count = (size_t)regs->dx;
+    loff_t *ppos = (loff_t *)regs->cx;
+    loff_t start;
     snapshot_device *sdev;
     snapshot_session *ses;
-    bool is_meta_or_bg;
+    unsigned long *kprobe_cpu;
+    int ncap = 0, nsched = 0;
 
-    if (!bio || !bio->bi_bdev) return 0;
-    if (!op_is_write(bio_op(bio))) return 0; 
-    if (bio->bi_opf & REQ_PREFLUSH) return 0;
-
-    sdev = find_device_for_bdev(bio->bi_bdev);
-    if (!sdev || !READ_ONCE(sdev->snapshot_active) ||
-        READ_ONCE(sdev->bdev) != bio->bi_bdev)
+    if (!file || !file->f_inode)
         return 0;
 
+    if (!file->f_inode->i_sb || !file->f_inode->i_sb->s_bdev)
+        return 0;
+    /*Search for device */
+    sdev = find_device_for_bdev(file->f_inode->i_sb->s_bdev);
+    if (!sdev || !READ_ONCE(sdev->snapshot_active) || READ_ONCE(sdev->bdev) != file->f_inode->i_sb->s_bdev)
+        return 0;
+     /*Get active session */
     ses = get_active_session_rcu(sdev);
-    if (!ses) return 0;
-
-    /* Check if user has written something) */
-    if (!READ_ONCE(ses->metadata_enabled)) {
-        if (snap_trace)
-            pr_info("SNAPSHOT: Ignoring write (no user writes yet) from %s\n", 
-                    current->comm);
+    if (!ses)
         return 0;
-    }
+
+    /* Initial offset */
+    start = ppos ? READ_ONCE(*ppos) : file->f_pos;
+
+    /* To enable blocking function add the trick*/
+    kprobe_cpu = __this_cpu_read(kprobe_context_pointer);
+    __this_cpu_write(*kprobe_cpu, 0UL);
+    preempt_enable();
+
+    ncap = cow_capture(file, start, count, ses);
+    /* Restore context*/
+    preempt_disable();
+    __this_cpu_write(*kprobe_cpu, (unsigned long)&the_probe);
     
-    //snap_log_submit_bio(is_meta_or_bg ? "submit_bio(META/BG)" : "submit_bio(DATA)", bio);
-    schedule_cow_mem_for_bio(ses, bio->bi_bdev, bio);
+    nsched = cow_schedule(file, start, count, ses);
+
+    if (ncap || nsched) {
+        pr_info("SNAPSHOT: vfs_write preimage: captured=%d scheduled=%d inode=%lu pid=%d comm=%s\n",
+                ncap, nsched, file->f_inode->i_ino, current->pid, current->comm);
+    }
+
     return 0;
 }
 
-static struct kprobe kp_submit_bio = { 
-    .symbol_name = "submit_bio",          
-    .pre_handler = submit_bio_entry
+static struct kprobe vfs_write_kp = {
+    .symbol_name = "vfs_write",
+    .pre_handler = vfs_write_entry,
 };
-
 /**
- * install_bio_hook - Install the write event hook and
+ * install_vfs_write_hook - Install the write event hook
  */
-int install_bio_kprobe(void)
+int install_vfs_write_hook(void)
+{
+    int ret = register_kprobe(&vfs_write_kp);
+    if (ret < 0) {
+        pr_err("SNAPSHOT: Failed to register kprobe on vfs_write: %d\n", ret);
+        return ret;
+    }
+    pr_info("SNAPSHOT: vfs_write hook installed\n");
+    return 0;
+}
+/**
+ * remove_vfs_write_hook - Remove the write event hook
+ */
+void remove_vfs_write_hook(void)
+{
+    unregister_kprobe(&vfs_write_kp);
+    pr_info("SNAPSHOT: vfs_write hook removed\n");
+}
+
+/*
+*   search pointer for the kprobe context.
+*/
+static int the_search(struct kprobe *kp, struct pt_regs *regs)
+{
+    unsigned long *temp = (unsigned long *)&BRUTE_START;
+
+    while (temp > 0) {
+        temp -= 1;
+        if ((unsigned long)__this_cpu_read(*temp) == (unsigned long)kp) {
+            atomic_inc(&successful_search_counter);
+            printk(KERN_DEBUG "SNAPSHOT: found kprobe context pointer at %p\n", temp);
+            reference_offset = temp;
+            break;
+        }
+        if(temp <= 0)
+            return 1;
+    }
+    __this_cpu_write(kprobe_context_pointer, temp);
+    return 0;
+}
+
+/*
+*   snapshot_kprobe_setup_init
+*/
+int snapshot_kprobe_setup_init(void)
 {
     int ret;
 
-    snapshot_bio_wq = alloc_workqueue("snapshot_bio_kp_wq",
-        WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
-    if (!snapshot_bio_wq) return -ENOMEM;
+    setup_probe.symbol_name = "run_on_cpu";
+    setup_probe.pre_handler  = (kprobe_pre_handler_t)the_search;
 
-    ret = register_kprobe(&kp_submit_bio);
-    if (!ret) { pr_info("SNAPSHOT: kprobe submit_bio\n"); return 0; }
+    ret = register_kprobe(&setup_probe);
+    if (ret < 0) {
+        pr_info("SNAPSHOT: hook init failed for the init kprobe setup, returned %d\n", ret);
+        return ret;
+    }
+    get_cpu();
+    smp_call_function((smp_call_func_t)run_on_cpu, NULL, 1);
 
-    destroy_workqueue(snapshot_bio_wq);
-    snapshot_bio_wq = NULL;
-    pr_err("SNAPSHOT: no submit_bio* symbol hookable (ret=%d)\n", ret);
-    return ret;
+    if (atomic_read(&successful_search_counter) < num_online_cpus() - 1 ) {
+        pr_info("SNAPSHOT: read hook load failed - number of setup CPUs is %ld - number of remote online CPUs is %d\n", atomic_read(&successful_search_counter), num_online_cpus() - 1);
+        put_cpu();
+        unregister_kprobe(&setup_probe);
+        return -1; 
+    }
+    if (reference_offset == 0x0){
+        pr_info("SNAPSHOT: inconsistent value found for refeence offset\n");
+        put_cpu();
+        unregister_kprobe(&setup_probe);
+        return -1;
+    }   
+    __this_cpu_write(kprobe_context_pointer, reference_offset);
+
+    put_cpu();
+
+    return 0;
 }
 /**
- * remove_bio_kprobe - Remove bio event hook
+ * remove_setup_probe - Remove the probe setup
  */
-void remove_bio_kprobe(void)
-{
-    unregister_kprobe(&kp_submit_bio);
-
-    if (snapshot_bio_wq) {
-        flush_workqueue(snapshot_bio_wq);
-        destroy_workqueue(snapshot_bio_wq);
-        snapshot_bio_wq = NULL;
-    }
-    pr_info("SNAPSHOT: BIO kprobe removed\n");
+void remove_setup_probe(void){
+    unregister_kprobe(&setup_probe);
+    pr_info("SNAPSHOT: Setup probe removed\n");
 }
 
 /**
@@ -1339,6 +1410,12 @@ int snapshot_init(void)
         pr_err("SNAPSHOT: Failed to create workqueue\n");
         return -ENOMEM;
     }
+
+    snapshot_bio_wq = alloc_workqueue("snapshot_bio_kp_wq", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+    if (!snapshot_bio_wq){
+        pr_err("SNAPSHOT: Failed to create bio workqueue\n");
+        return -ENOMEM;
+    } 
     
     pr_info("SNAPSHOT: Subsystem initialized\n");
     return 0;
@@ -1353,6 +1430,12 @@ void snapshot_exit(void)
         flush_workqueue(snapshot_wq);
         destroy_workqueue(snapshot_wq);
         snapshot_wq = NULL;
+    }
+
+    if (snapshot_bio_wq) {
+        flush_workqueue(snapshot_bio_wq);
+        destroy_workqueue(snapshot_bio_wq);
+        snapshot_bio_wq = NULL;
     }
     
     pr_info("SNAPSHOT: Subsystem cleaned up\n");

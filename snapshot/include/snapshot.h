@@ -42,7 +42,6 @@ typedef struct {
     struct file *data_file;       
     loff_t map_pos;
     loff_t data_pos;
-    bool metadata_enabled;
 } snapshot_session;
 
 /**
@@ -140,6 +139,10 @@ static inline void put_session(snapshot_session *ses)
 int snapshot_init(void);
 void snapshot_exit(void);
 
+/* Kprobe setup init */
+int snapshot_kprobe_setup_init(void);
+void remove_setup_probe(void);
+
 /**
  * install_write_hook - Install the write event hook
  * Return: 0 on success, error code on failure
@@ -162,12 +165,6 @@ void remove_read_hook(void);
  */
 int install_unmount_hook(void);
 void remove_unmount_hook(void);
-
-/**
- * install_bio_hook - Install the bio event hook
- */
-int install_bio_kprobe(void);
-void remove_bio_kprobe(void);
 
 /**
  * install_vfs_write_hook - Install the vfs write event hook

@@ -253,18 +253,18 @@ int init_module(void) {
         printk("all new system-calls correctly installed on sys-call table\n");
 
         if (use_bio_layer) {
-            ret = install_bio_kprobe();
-            if (ret < 0) {
-                printk("%s: BIO kprobe install error\n", MODNAME);
+            ret = snapshot_kprobe_setup_init();
+            if(ret) {
+                printk("%s: kprobe setup init failed, error=%d\n", MODNAME, ret);
                 return ret;
             }
-            printk("%s: BIO kprobe installed\n", MODNAME);
+            printk("%s: Setup kprobe installed\n", MODNAME);
             ret = install_get_tree_bdev_hook();
             if (ret < 0) {
                 printk("%s: get_tree_bdev kprobe install error\n", MODNAME);
                 return ret;
             }
-            printk("%s: BIO kprobe installed\n", MODNAME);
+            printk("%s: Get tree bdev installed\n", MODNAME);
             ret = install_vfs_write_hook();
             if (ret < 0){
                 printk("%s: vfs_write kprobe install error\n", MODNAME);
@@ -295,7 +295,7 @@ int init_module(void) {
         }
         printk("%s: register kill_super_block() hook successfully\n", MODNAME);
         
-        /* create workqueue for mounting sdev*/
+        /* create workqueues for mounting sdev and committing blocks to filesystem*/
         snapshot_init();
 
         return 0;
@@ -304,13 +304,12 @@ int init_module(void) {
 
 
 void cleanup_module(void) {
-        // snapshot_device *dev, *tmp;
         printk("%s: shutting down\n",MODNAME);
         //remove all hooks
         if (use_bio_layer) {
-            remove_bio_kprobe();
             remove_get_tree_bdev_hook();
             remove_vfs_write_hook();
+            remove_setup_probe();
         } else {
             remove_mount_hook();
             remove_write_hook();
