@@ -346,7 +346,7 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp)
     xa_init(&session->saved_blocks);
     xa_init(&session->pending_block);
     INIT_LIST_HEAD(&session->list);
-    atomic_set(&session->ref_count, 1);
+    atomic_set(&session->ref_cleanup, 1);
     atomic64_set(&session->blocks_count, 0);
     
     pr_info("SNAPSHOT: Created session with timestamp %llu\n", timestamp);
@@ -595,137 +595,6 @@ static int create_snapshot_subdirectory(snapshot_session *session,
     kfree(path);
     return err;
 }
-
-
-/**
- * mount_work_handler - Workqueue handler for mount events
- * 
- */
-static void mount_work_handler(struct work_struct *work) {
-    struct mount_work *mw = container_of(work, struct mount_work, work);
-    snapshot_device *sdev;
-    snapshot_session *session;
-    u64 timestamp;
-    int ret;
-
-    /* Device was already found in handle_mount_event, it's passed via work */
-    sdev = mw->sdev;
-    
-    if (!sdev) {
-        pr_err("SNAPSHOT: No device in mount_work\n");
-        goto cleanup;
-    }
-    if (mw->action == SNAP_WORK_START) {
-
-        /* Check if snapshot is still active */
-        if (!sdev->snapshot_active) {
-            pr_info("SNAPSHOT: Snapshot no longer active for: %s\n", sdev->name);
-            goto cleanup;
-        }
-
-        /* Create new session */
-        timestamp = ktime_get_real_ns();
-        session = create_session(sdev, timestamp);
-        if (!session) {
-            pr_err("SNAPSHOT: Failed to create session for: %s\n", sdev->name);
-            goto cleanup;
-        }
-
-        /* Create snapshot subdirectory - use the device name from sdev */
-        ret = create_snapshot_subdirectory(session, sdev->name, mw->fs_type);
-        if (ret) {
-            pr_err("SNAPSHOT: Failed to create directory: %d\n", ret);
-            destroy_session(session);
-            goto cleanup;
-        }
-
-        /* Add session to device */
-        spin_lock(&sdev->lock);
-        list_add_tail(&session->list, &sdev->sessions);
-        spin_unlock(&sdev->lock);
-
-        /*Assign active session for device*/
-        rcu_assign_pointer(sdev->active_session, session); 
-
-        pr_info("SNAPSHOT: Session %llu started\n",
-            timestamp);
-
-    } else { 
-        pr_info("SNAPSHOT: Unmount work -> stopping sessions for %s\n", sdev->name);
-        stop_sessions_for_bdev(sdev);
-    }
-    cleanup:
-        kfree(mw);
-}
-
-/**
- * start_session_for_bdev - Queue work to start a session
- * 
- * Called from kprobe handler
- */
-int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts, const char *fs_type) {
-    struct mount_work *mw;
-
-    /* Allocate work structure */
-    mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
-    if (!mw)
-        return -ENOMEM;
-
-    /* Initialize work */
-    INIT_WORK(&mw->work, mount_work_handler);
-    mw->bdev = bdev;
-    mw->sdev = sdev; 
-    mw->fs_type = fs_type;
-    mw->action = SNAP_WORK_START;
-
-    /* Queue the work */
-    if (!queue_work(snapshot_wq, &mw->work)) {
-        pr_err("SNAPSHOT: Failed to queue mount work\n");
-        kfree(mw);
-        return -EAGAIN;
-    }
-
-    if (out_ts)
-        *out_ts = ktime_get_real_ns();
-
-    return 0;
-}
-
-/**
- * stop_sessions_for_bdev - Stop all sessions for a device
- */
-int stop_sessions_for_bdev(snapshot_device *sdev)
-{
-    LIST_HEAD(to_free);
-    snapshot_session *session;
-    /* Return if there isn't a device attached*/
-    if (!sdev || !sdev->bdev)
-        return -EINVAL;
-
-    pr_info("SNAPSHOT: Stopping all sessions for: %s\n", sdev->name);
-
-    /* Get active session*/
-    rcu_read_lock();
-    session = rcu_dereference(sdev->active_session);
-    rcu_read_unlock();
-
-    if (!session)
-        return 0;
-
-    /* Detach under spinlock */
-    spin_lock(&sdev->lock);
-    RCU_INIT_POINTER(sdev->active_session, NULL);
-    list_del_init(&session->list);
-    spin_unlock(&sdev->lock);
-
-    /* Wait all RCU readers before destroying session */
-    synchronize_rcu();
-
-    /* Do not destroy session here, we must let finish our workers*/
-    //release the main ref that was added when the session was created
-    put_session(session);
-    return 0;
-}
 static void cow_mem_worker(struct work_struct *w)
 {
     struct cow_mem_work *mw = container_of(w, struct cow_mem_work, work);
@@ -827,6 +696,166 @@ static int enqueue_cow_mem(snapshot_session *session,
 
     return 1;  /* Queued successfully */
 }
+
+/**
+ * flush_pending_blocks - After creation of files flush blocks to disk if captured 
+ * before the reference counter "ref_files_ready" was 0
+ */
+static void flush_pending_blocks(snapshot_session *ses)
+{
+    unsigned long index;
+    void *entry;
+
+    xa_for_each(&ses->pending_block, index, entry) {
+        if (!entry) continue;
+
+        if (!xa_is_value(entry)) {
+            if (enqueue_cow_mem(ses, (sector_t)index, entry, COW_BLK_SZ) <= 0) {
+                pr_warn("SNAPSHOT: flush enqueue failed key=%lu\n", index);
+            }
+        }
+    }
+}
+/**
+ * mount_work_handler - Workqueue handler for mount events
+ * 
+ */
+static void mount_work_handler(struct work_struct *work) {
+    struct mount_work *mw = container_of(work, struct mount_work, work);
+    snapshot_device *sdev;
+    snapshot_session *session;
+    u64 timestamp;
+    int ret;
+
+    /* Device was already found in handle_mount_event, it's passed via work */
+    sdev = mw->sdev;
+    
+    if (!sdev) {
+        pr_err("SNAPSHOT: No device in mount_work\n");
+        goto cleanup;
+    }
+    if (mw->action == SNAP_WORK_START) {
+
+        /* Check if snapshot is still active */
+        if (!sdev->snapshot_active) {
+            pr_info("SNAPSHOT: Snapshot no longer active for: %s\n", sdev->name);
+            goto cleanup;
+        }
+
+        if (!mw->bdev || !mw->bdev->bd_disk) {
+            pr_info("SNAPSHOT: Device no longer valid\n");
+            goto cleanup;
+        }
+
+        /* Create new session */
+        timestamp = ktime_get_real_ns();
+        session = create_session(sdev, timestamp);
+        if (!session) {
+            pr_err("SNAPSHOT: Failed to create session for: %s\n", sdev->name);
+            goto cleanup;
+        }
+        /* Add session to device */
+        spin_lock(&sdev->lock);
+        list_add_tail(&session->list, &sdev->sessions);
+        spin_unlock(&sdev->lock);
+
+        /*Assign active session for device*/
+        rcu_assign_pointer(sdev->active_session, session); 
+
+        atomic_set(&session->ref_files_ready, 0);
+
+        /* Create snapshot subdirectory - use the device name from sdev */
+        ret = create_snapshot_subdirectory(session, sdev->name, mw->fs_type);
+        if (ret) {
+            pr_err("SNAPSHOT: Failed to create directory: %d\n", ret);
+            destroy_session(session);
+            goto cleanup;
+        }
+
+        atomic_set(&session->ref_files_ready, 1);
+        smp_wmb();  // Memory barrier
+
+        flush_pending_blocks(session);
+        pr_info("SNAPSHOT: Session %llu started\n",
+            timestamp);
+
+    } else { 
+        pr_info("SNAPSHOT: Unmount work -> stopping sessions for %s\n", sdev->name);
+        stop_sessions_for_bdev(sdev);
+    }
+    cleanup:
+        kfree(mw);
+}
+
+/**
+ * start_session_for_bdev - Queue work to start a session
+ * 
+ * Called from kprobe handler
+ */
+int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64 *out_ts, const char *fs_type) {
+    struct mount_work *mw;
+
+    /* Allocate work structure */
+    mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
+    if (!mw)
+        return -ENOMEM;
+
+    /* Initialize work */
+    INIT_WORK(&mw->work, mount_work_handler);
+    mw->bdev = bdev;
+    mw->sdev = sdev; 
+    mw->fs_type = fs_type;
+    mw->action = SNAP_WORK_START;
+
+    /* Queue the work */
+    if (!queue_work(snapshot_wq, &mw->work)) {
+        pr_err("SNAPSHOT: Failed to queue mount work\n");
+        kfree(mw);
+        return -EAGAIN;
+    }
+
+    if (out_ts)
+        *out_ts = ktime_get_real_ns();
+
+    return 0;
+}
+
+/**
+ * stop_sessions_for_bdev - Stop all sessions for a device
+ */
+int stop_sessions_for_bdev(snapshot_device *sdev)
+{
+    LIST_HEAD(to_free);
+    snapshot_session *session;
+    /* Return if there isn't a device attached*/
+    if (!sdev || !sdev->bdev)
+        return -EINVAL;
+
+    pr_info("SNAPSHOT: Stopping all sessions for: %s\n", sdev->name);
+
+    /* Get active session*/
+    rcu_read_lock();
+    session = rcu_dereference(sdev->active_session);
+    rcu_read_unlock();
+
+    if (!session)
+        return 0;
+
+    /* Detach under spinlock */
+    spin_lock(&sdev->lock);
+    RCU_INIT_POINTER(sdev->active_session, NULL);
+    list_del_init(&session->list);
+    spin_unlock(&sdev->lock);
+
+    /* Wait all RCU readers before destroying session */
+    synchronize_rcu();
+
+    /* Do not destroy session here, we must let finish our workers*/
+    //release the main ref that was added when the session was created
+    put_session(session);
+    return 0;
+}
+
 
 /**
  * write_dirty_buffer_handler - Kretprobe handler for write_dirty_buffer
@@ -1082,6 +1111,7 @@ static int read_old_block(struct block_device *bdev, sector_t key, void *buf, un
     }
 
     __free_page(page);
+    //release ref
     bio_put(bio);
     return ret;
 }
@@ -1224,11 +1254,12 @@ static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
     sdev = find_device_for_bdev(file->f_inode->i_sb->s_bdev);
     if (!sdev || !READ_ONCE(sdev->snapshot_active) || READ_ONCE(sdev->bdev) != file->f_inode->i_sb->s_bdev)
         return 0;
-     /*Get active session */
+    /*Get active session */
     ses = get_active_session_rcu(sdev);
     if (!ses)
         return 0;
 
+    /* We do not check if files are ready here, let our vfs capture the first write*/
     /* Initial offset */
     start = ppos ? READ_ONCE(*ppos) : file->f_pos;
 
@@ -1236,13 +1267,15 @@ static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
     kprobe_cpu = __this_cpu_read(kprobe_context_pointer);
     __this_cpu_write(*kprobe_cpu, 0UL);
     preempt_enable();
-
+    
     ncap = cow_capture(file, start, count, ses);
     /* Restore context*/
     preempt_disable();
     __this_cpu_write(*kprobe_cpu, (unsigned long)&the_probe);
-    
-    nsched = cow_schedule(file, start, count, ses);
+
+    /* If the files are ready we can schedule the persistence to disk */
+    if (atomic_read(&ses->ref_files_ready))
+        nsched = cow_schedule(file, start, count, ses);
 
     if (ncap || nsched) {
         pr_info("SNAPSHOT: vfs_write preimage: captured=%d scheduled=%d inode=%lu pid=%d comm=%s\n",
@@ -1256,6 +1289,7 @@ static struct kprobe vfs_write_kp = {
     .symbol_name = "vfs_write",
     .pre_handler = vfs_write_entry,
 };
+
 /**
  * install_vfs_write_hook - Install the write event hook
  */
@@ -1319,7 +1353,7 @@ int snapshot_kprobe_setup_init(void)
     smp_call_function((smp_call_func_t)run_on_cpu, NULL, 1);
 
     if (atomic_read(&successful_search_counter) < num_online_cpus() - 1 ) {
-        pr_info("SNAPSHOT: read hook load failed - number of setup CPUs is %ld - number of remote online CPUs is %d\n", atomic_read(&successful_search_counter), num_online_cpus() - 1);
+        pr_info("SNAPSHOT: read hook load failed - number of setup CPUs is %d - number of remote online CPUs is %d\n", atomic_read(&successful_search_counter), num_online_cpus() - 1);
         put_cpu();
         unregister_kprobe(&setup_probe);
         return -1; 
@@ -1404,8 +1438,8 @@ void remove_unmount_hook(void)
  */
 int snapshot_init(void)
 {
-    /* Create workqueue for handling mount events */
-    snapshot_wq = alloc_workqueue("snapshot_wq", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+    /* Create workqueue for handling mount/unmount events */
+    snapshot_wq = alloc_workqueue("snapshot_wq", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
     if (!snapshot_wq) {
         pr_err("SNAPSHOT: Failed to create workqueue\n");
         return -ENOMEM;

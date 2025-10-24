@@ -22,7 +22,8 @@
  * @pending_block: XArray of blocks pending to be copied
  * @blocks_count: Count of blocks saved in this session
  * @list: List head for linking sessions
- * @ref_count: Reference counter for safe cleanup
+ * @ref_cleanup: Reference counter for safe cleanup after a device is unmonted
+ * @ref_files_ready: Reference counter to acknowledge file creation and readiness (0 not ready, 1 ready)
  * @map_file: File pointer for blocks.map
  * @data_file: File pointer for blocks.dat
  * @map_pos: Current write position in blocks.map
@@ -37,7 +38,8 @@ typedef struct {
     struct xarray pending_block; 
     atomic64_t blocks_count;
     struct list_head list;
-    atomic_t ref_count;
+    atomic_t ref_cleanup;
+    atomic_t ref_files_ready;
     struct file *map_file;        
     struct file *data_file;       
     loff_t map_pos;
@@ -119,7 +121,7 @@ static inline snapshot_session *get_active_session_rcu(snapshot_device *sdev)
 static inline snapshot_session *get_session(snapshot_session *ses)
 {
     if (ses)
-        atomic_inc(&ses->ref_count);
+        atomic_inc(&ses->ref_cleanup);
     return ses;
 }
 
@@ -127,11 +129,11 @@ static inline void put_session(snapshot_session *ses)
 {
     if (!ses) return;
 
-    if (atomic_dec_and_test(&ses->ref_count)) {
+    if (atomic_dec_and_test(&ses->ref_cleanup)) {
         destroy_session(ses); 
     } else {
         pr_debug("SNAPSHOT: put_session: session %llu refcount is now %d\n", 
-                 ses->timestamp, atomic_read(&ses->ref_count));
+                 ses->timestamp, atomic_read(&ses->ref_cleanup));
     }
 }
 
