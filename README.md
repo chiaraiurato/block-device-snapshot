@@ -18,8 +18,24 @@ The system consists of :
 5.  **User-space CLI (`user/user.c`)**: A simple program that invokes the custom system calls to `activate` or `deactivate` the snapshot service for a given device.
 6.  **Restore Utility (`restore/restore.c`)**: A command-line tool that reads the snapshot data and allows a user to interactively select a session to restore, overwriting the block device with the saved pre-images.
 
-### Snapshot Data Structure
+## Some Details about implementation
 
+This module implements two alternative mechanisms for Copy-on-Write (CoW) snapshots:
+1. **Buffer-cache hooking for SingleFileFS support.**    
+   - `vfs_write` marks candidate blocks in `staged_blocks`.
+   - `_ _bread_gfp` copies the *old data* into `pending_block` when a staged key is seen and nothing is saved yet.
+   - `write_dirty_buffer` confirms the write: it swaps the `pending_block` entry with a sentinel and enqueues persistence work.
+   - If the snapshot files are ready, a worker (`cow_mem_worker`) writes `blocks.dat` + `blocks.map`, marks `saved_blocks[key]=1`, and clears `pending_block[key]`.
+
+   ![Snapshot flow — buffer-cache hooking](doc/BH_Hooking.png)
+
+2. **Vfs_write hooking + synchronous BIO read for modern FS like EXT4.**  
+   For filesystems that no longer use the buffer cache, we only hook `vfs_write` and perform synchronous reads of the old blocks with `submit_bio_wait`:
+   - `vfs_write` computes the affected logical blocks, and for each block:
+     - if not in `saved_blocks`/`pending_block`, we read the old contents via `submit_bio_wait` and place the copy into `pending_block`.
+   - If the snapshot files are ready, we enqueue the worker to persist data as above (`cow_mem_worker`).
+
+### Snapshot Directory Structure
 When a snapshot session is active, data is stored in the `/snapshot` directory on the root filesystem. Each session creates a unique subdirectory with the timestamp at mount event.
 
 ```
