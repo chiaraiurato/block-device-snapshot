@@ -12,6 +12,7 @@
 #include <linux/kprobes.h>
 #include <linux/bio.h>
 #include <linux/buffer_head.h>
+#include <linux/string.h>
 #include "include/snapshot.h"
 #include <linux/mnt_idmapping.h>
 #include "../register/include/register.h"
@@ -26,6 +27,7 @@
 #define COW_SECT_PER_BLK    (COW_BLK_SZ / COW_SECT_SZ)
 #define ALIGN_DOWN_SECT(s)  ((s) & ~((sector_t)COW_SECT_PER_BLK - 1))
 #define ALIGN_UP_SECT(s)    (((s) + COW_SECT_PER_BLK - 1) & ~((sector_t)COW_SECT_PER_BLK - 1))
+static bool g_use_bio_layer;
 
 DEFINE_PER_CPU(unsigned long, BRUTE_START);//redundant you might use the below per-cpu variable to setup the initial search address
 DEFINE_PER_CPU(unsigned long *, kprobe_context_pointer);//this is used for steady state operations 
@@ -341,7 +343,8 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp)
     session->timestamp = timestamp;
     session->sdev = sdev;
     session->snapshot_dir[0] = '\0';
-    
+    if (!g_use_bio_layer)
+        xa_init(&session->staged_blocks);
     mutex_init(&session->dir_mtx);
     xa_init(&session->saved_blocks);
     xa_init(&session->pending_block);
@@ -384,6 +387,8 @@ void destroy_session(snapshot_session *session)
     
     xa_destroy(&session->saved_blocks);
     xa_destroy(&session->pending_block);
+    if(!g_use_bio_layer)
+        xa_destroy(&session->staged_blocks);
     mutex_destroy(&session->dir_mtx);
     kfree(session);
 }
@@ -891,6 +896,8 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
                 (unsigned long long)key);
         return 0;
     }
+    /*Write confirmed, wen can delete the key from staged*/
+    xa_erase(&ses->staged_blocks, key);
 
     //snap_dump_bh("WRITE_CONFIRMED", bh, key, true);
     /*Take old data and replace data with a sentinel*/
@@ -967,7 +974,11 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     key = (sector_t)bh->b_blocknr * (bh->b_size >> 9);
 
     //snap_dump_bh("COW_CAPTURE", bh, key, false);
-
+    /* If no blocks are currently staged for this key, exit. No write operation intercepted. */
+    if (!xa_load(&ses->staged_blocks, key)){
+        pr_info("SNAPSHOT: No write occurs. Skipping the copy of old blocks");
+        return 0;
+    }
     if (xa_load(&ses->saved_blocks, key) || xa_load(&ses->pending_block, key)) {
         return 0;
     }
@@ -983,7 +994,7 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     if (xa_insert(&ses->pending_block, key, copy, GFP_ATOMIC)) {
         kfree(copy);
     } else {
-        pr_info("SNAPSHOT: Block cached blk=%llu size=%zu key=%llu\n",
+        pr_info("SNAPSHOT: Block cached in pending blocks blk=%llu size=%zu key=%llu\n",
                 (unsigned long long)bh->b_blocknr,
                 (size_t)bh->b_size,
                 (unsigned long long)key);
@@ -1116,19 +1127,26 @@ static int read_old_block(struct block_device *bdev, sector_t key, void *buf, un
     return ret;
 }
 
-static sector_t inode_bmap_block(struct inode *inode, sector_t lblock)
+static sector_t get_physical_block(struct inode *inode, sector_t lblock)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
     if (inode->i_mapping && inode->i_mapping->a_ops && inode->i_mapping->a_ops->bmap)
         /* bmap(mapping, lblock) : pblock (sector_t) */
         return inode->i_mapping->a_ops->bmap(inode->i_mapping, lblock);
 #endif
-    /* bmap(inode, sector_t *), 0 = success */
     {
-        sector_t pblock = lblock;
-        if (bmap(inode, &pblock) == 0)
-            return pblock; 
-        return 0;     
+        /*Since singlefilefs has [superblock][inode][file_data][..] we need to shif by 2*/
+        struct super_block *sb = inode->i_sb;
+        if (sb && sb->s_type && sb->s_type->name &&
+            strcmp(sb->s_type->name, "singlefilefs") == 0) {
+            return lblock + 2;   
+        }else{
+            /* EXT4 support bmap*/
+            sector_t pblock = lblock;
+            if (bmap(inode, &pblock) == 0)
+                return pblock;
+            return 0;
+        }     
     }
 }
 
@@ -1146,7 +1164,7 @@ static int cow_schedule(struct file *file,
     int scheduled = 0;
 
     for (sector_t l = lfirst; l <= llast; ++l) {
-        sector_t pblock = inode_bmap_block(inode, l);
+        sector_t pblock = get_physical_block(inode, l);
         sector_t key;
         void *ptr;
 
@@ -1199,7 +1217,7 @@ static int cow_capture(struct file *file,
     llast  = (sector_t)(end   >> blksize_bits);
 
     for (l = lfirst; l <= llast; ++l) {
-        sector_t pblock = inode_bmap_block(inode, l);
+        sector_t pblock = get_physical_block(inode, l);
         sector_t key;
         void *copy;
 
@@ -1239,7 +1257,7 @@ static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
     struct file *file = (struct file *)regs->di;
     size_t count = (size_t)regs->dx;
     loff_t *ppos = (loff_t *)regs->cx;
-    loff_t start;
+    loff_t start_offset;
     snapshot_device *sdev;
     snapshot_session *ses;
     unsigned long *kprobe_cpu;
@@ -1250,39 +1268,70 @@ static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
 
     if (!file->f_inode->i_sb || !file->f_inode->i_sb->s_bdev)
         return 0;
+
     /*Search for device */
     sdev = find_device_for_bdev(file->f_inode->i_sb->s_bdev);
     if (!sdev || !READ_ONCE(sdev->snapshot_active) || READ_ONCE(sdev->bdev) != file->f_inode->i_sb->s_bdev)
         return 0;
+    
     /*Get active session */
     ses = get_active_session_rcu(sdev);
     if (!ses)
         return 0;
 
-    /* We do not check if files are ready here, let our vfs capture the first write*/
     /* Initial offset */
-    start = ppos ? READ_ONCE(*ppos) : file->f_pos;
+    start_offset = ppos ? READ_ONCE(*ppos) : file->f_pos;
+    if (g_use_bio_layer) {
+        /* We do not check if files are ready here, let our vfs capture the first write*/
 
-    /* To enable blocking function add the trick*/
-    kprobe_cpu = __this_cpu_read(kprobe_context_pointer);
-    __this_cpu_write(*kprobe_cpu, 0UL);
-    preempt_enable();
-    
-    ncap = cow_capture(file, start, count, ses);
-    /* Restore context*/
-    preempt_disable();
-    __this_cpu_write(*kprobe_cpu, (unsigned long)&the_probe);
+        /* To enable blocking service add the patch*/
+        kprobe_cpu = __this_cpu_read(kprobe_context_pointer);
+        __this_cpu_write(*kprobe_cpu, 0UL);
+        preempt_enable();
+        
+        ncap = cow_capture(file, start_offset, count, ses);
+        /* Restore context*/
+        preempt_disable();
+        __this_cpu_write(*kprobe_cpu, (unsigned long)&the_probe);
 
-    /* If the files are ready we can schedule the persistence to disk */
-    if (atomic_read(&ses->ref_files_ready))
-        nsched = cow_schedule(file, start, count, ses);
+        /* If the files are ready we can schedule the persistence to disk */
+        if (atomic_read(&ses->ref_files_ready))
+            nsched = cow_schedule(file, start_offset, count, ses);
 
-    if (ncap || nsched) {
-        pr_info("SNAPSHOT: vfs_write preimage: captured=%d scheduled=%d inode=%lu pid=%d comm=%s\n",
-                ncap, nsched, file->f_inode->i_ino, current->pid, current->comm);
+        if (ncap || nsched) {
+            pr_info("SNAPSHOT: vfs_write preimage: captured=%d scheduled=%d inode=%lu pid=%d comm=%s\n",
+                    ncap, nsched, file->f_inode->i_ino, current->pid, current->comm);
+        }
+
+        return 0;
+    }else{
+        sector_t start_block, end_block;
+        loff_t end_offset;
+        end_offset = READ_ONCE(*ppos) + count - 1;
+        
+        start_block = start_offset >> file->f_inode->i_blkbits;
+        end_block = end_offset >> file->f_inode->i_blkbits;
+        
+        for (sector_t lblock = start_block; lblock <= end_block; lblock++) {
+            // Convert logical block to physical blocks
+            sector_t pblock = get_physical_block(file->f_inode, lblock);
+            if (!pblock)
+                continue;
+            
+            sector_t key = pblock * (file->f_inode->i_sb->s_blocksize >> 9);
+
+            if (!xa_load(&ses->saved_blocks, key)) {
+                xa_store(&ses->staged_blocks, key, xa_mk_value(1), GFP_ATOMIC);
+                
+                pr_info("SNAPSHOT: vfs_write marks staged_blocks with key=%llu "
+                        "(file=%s pid=%d)\n",
+                        (unsigned long long)key,
+                        file->f_path.dentry->d_name.name,
+                        current->pid);
+            }
+        }
+        return 0;
     }
-
-    return 0;
 }
 
 static struct kprobe vfs_write_kp = {
@@ -1293,8 +1342,9 @@ static struct kprobe vfs_write_kp = {
 /**
  * install_vfs_write_hook - Install the write event hook
  */
-int install_vfs_write_hook(void)
+int install_vfs_write_hook(bool use_bio_layer)
 {
+    g_use_bio_layer = use_bio_layer;
     int ret = register_kprobe(&vfs_write_kp);
     if (ret < 0) {
         pr_err("SNAPSHOT: Failed to register kprobe on vfs_write: %d\n", ret);
@@ -1359,7 +1409,7 @@ int snapshot_kprobe_setup_init(void)
         return -1; 
     }
     if (reference_offset == 0x0){
-        pr_info("SNAPSHOT: inconsistent value found for refeence offset\n");
+        pr_info("SNAPSHOT: inconsistent value found for reference offset\n");
         put_cpu();
         unregister_kprobe(&setup_probe);
         return -1;

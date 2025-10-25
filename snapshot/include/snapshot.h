@@ -19,7 +19,8 @@
  * @snapshot_dir: Directory path for storing snapshots
  * @dir_mtx: Mutex to protect snapshot_dir creation
  * @saved_blocks: XArray of saved blocks (key: sector_t, value: block data)
- * @pending_block: XArray of blocks pending to be copied
+ * @pending_block: XArray of pending blocks to be copied (ie. captured from sb_read)
+ * @staged_blocks: XArray of staged blocks (ie. the one captured from vfs_write)
  * @blocks_count: Count of blocks saved in this session
  * @list: List head for linking sessions
  * @ref_cleanup: Reference counter for safe cleanup after a device is unmonted
@@ -36,6 +37,7 @@ typedef struct {
     struct mutex dir_mtx;
     struct xarray saved_blocks;
     struct xarray pending_block; 
+    struct xarray staged_blocks;
     atomic64_t blocks_count;
     struct list_head list;
     atomic_t ref_cleanup;
@@ -171,7 +173,7 @@ void remove_unmount_hook(void);
 /**
  * install_vfs_write_hook - Install the vfs write event hook
  */
-int install_vfs_write_hook(void);
+int install_vfs_write_hook(bool use_bio_layer);
 void remove_vfs_write_hook(void);
 
 #endif

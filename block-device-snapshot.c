@@ -81,7 +81,7 @@ module_param_string(the_snapshot_secret, the_snapshot_secret, HASH_LEN, 0);
 MODULE_PARM_DESC(the_snapshot_secret, "Password used for authentication");
 
 static bool use_bio_layer = true;
-module_param_named(use_bio_layer, use_bio_layer, bool, 0644);
+module_param_named(use_bio_layer, use_bio_layer, bool, 0444);
 MODULE_PARM_DESC(use_bio_layer, "Use BIO-layer kprobe (true) or buffer-cache kprobes (false)");
 
 static int handle_snapshot_operation(const char __user *devname, 
@@ -252,6 +252,9 @@ int init_module(void) {
 
         printk("all new system-calls correctly installed on sys-call table\n");
 
+        /* create workqueues for mounting sdev and committing blocks to filesystem*/
+        snapshot_init();
+        
         if (use_bio_layer) {
             ret = snapshot_kprobe_setup_init();
             if(ret) {
@@ -265,12 +268,6 @@ int init_module(void) {
                 return ret;
             }
             printk("%s: Get tree bdev installed\n", MODNAME);
-            ret = install_vfs_write_hook();
-            if (ret < 0){
-                printk("%s: vfs_write kprobe install error\n", MODNAME);
-                return ret;
-            }
-            printk("%s: vfs_write() kprobe installed\n", MODNAME);
         } else {
             ret = install_mount_hook();
             if (ret < 0) {
@@ -287,7 +284,13 @@ int init_module(void) {
             if (ret < 0) { printk("%s: read hook err\n", MODNAME); return ret; }
             printk("%s: register __bread_gfp() hook successfully\n", MODNAME);
         }
-
+        ret = install_vfs_write_hook(use_bio_layer);
+            if (ret < 0){
+                printk("%s: vfs_write kprobe install error\n", MODNAME);
+                return ret;
+            }
+            printk("%s: vfs_write() kprobe installed\n", MODNAME);
+        
         ret = install_unmount_hook();
         if (ret < 0) {
             printk("%s: Error while hooking kill_superblock\n", MODNAME);
@@ -295,8 +298,6 @@ int init_module(void) {
         }
         printk("%s: register kill_super_block() hook successfully\n", MODNAME);
         
-        /* create workqueues for mounting sdev and committing blocks to filesystem*/
-        snapshot_init();
 
         return 0;
 
@@ -308,7 +309,6 @@ void cleanup_module(void) {
         //remove all hooks
         if (use_bio_layer) {
             remove_get_tree_bdev_hook();
-            remove_vfs_write_hook();
             remove_setup_probe();
         } else {
             remove_mount_hook();
@@ -316,7 +316,7 @@ void cleanup_module(void) {
             remove_read_hook();
         }
         remove_unmount_hook();
-
+        remove_vfs_write_hook();
         unprotect_memory();
         for(int i=0;i<HACKED_ENTRIES;i++){
                 ((unsigned long *)the_syscall_table)[restore[i]] = the_ni_syscall;
