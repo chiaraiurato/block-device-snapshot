@@ -12,6 +12,8 @@
 #define COW_BLK_SZ          4096u
 #define COW_SECT_SZ         512u
 
+#define MODNAME "SNAPSHOT"
+
 /**
  * struct snapshot_session - Represents a snapshot session
  * @timestamp: Unique identifier for the snapshot session

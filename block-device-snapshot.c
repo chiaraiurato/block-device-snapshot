@@ -55,7 +55,6 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Iurato Chiara <chiara.iurat@gmail.com>");
 MODULE_DESCRIPTION("block device snapshot");
 
-#define MODNAME "SNAPSHOT"
 
 static struct salted_hash *password_digest;
 

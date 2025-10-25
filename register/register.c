@@ -35,7 +35,7 @@ int ensure_snapshot_root_directory(void)
     /* Create the directory */
     dentry = kern_path_create(AT_FDCWD, "/snapshot", &root_path, LOOKUP_DIRECTORY);
     if (IS_ERR(dentry)) {
-        pr_err("SNAPSHOT: Failed to prepare /snapshot path: %ld\n", PTR_ERR(dentry));
+        pr_err("%s: Failed to prepare /snapshot path: %ld\n", MODNAME, PTR_ERR(dentry));
         return PTR_ERR(dentry);
     }
 
@@ -46,9 +46,9 @@ int ensure_snapshot_root_directory(void)
 #endif
 
     if (err && err != -EEXIST) {
-        pr_err("SNAPSHOT: Failed to create /snapshot: %d\n", err);
+        pr_err("%s: Failed to create /snapshot: %d\n", MODNAME, err);
     } else {
-        pr_info("SNAPSHOT: /snapshot directory ready\n");
+        pr_info("%s: /snapshot directory ready\n", MODNAME);
         err = 0;
     }
 
@@ -68,18 +68,18 @@ int validate_user_path(const char *userspec, char *out, size_t len) {
     int err;
 
     if (!userspec || !out || len == 0) {
-        pr_err("SNAPSHOT: Invalid parameters\n");
+        pr_err("%s: Invalid parameters\n", MODNAME);
         return -EINVAL;
     }
 
     err = kern_path(userspec, LOOKUP_FOLLOW, &p);
     if (err) {
-        pr_err("SNAPSHOT: kern_path failed for '%s': %d\n", userspec, err);
+        pr_err("%s: kern_path failed for '%s': %d\n", MODNAME, userspec, err);
         return err;
     }
 
     if (!p.dentry || !d_inode(p.dentry)) {
-        pr_err("SNAPSHOT: Invalid path structure\n");
+        pr_err("%s: Invalid path structure\n", MODNAME);
         path_put(&p);
         return -EINVAL;
     }
@@ -89,7 +89,7 @@ int validate_user_path(const char *userspec, char *out, size_t len) {
     path_put(&p);
     
     if (IS_ERR(tmp)) {
-        pr_err("SNAPSHOT: d_path failed: %ld\n", PTR_ERR(tmp));
+        pr_err("%s: d_path failed: %ld\n", MODNAME, PTR_ERR(tmp));
         return PTR_ERR(tmp);
     }
     
@@ -199,7 +199,7 @@ snapshot_device *find_device_for_bdev(struct block_device *bdev)
  */
 #if LINUX_VERSION_CODE <= KERNEL_VERSION(5,16,0)
 void handle_mount_event(struct block_device *bd) {
-    pr_warn("SNAPSHOT: Mount events not supported for kernel < 5.16\n");
+    pr_warn("%s: Mount events not supported for kernel < 5.16\n", MODNAME);
 }
 #else
 void handle_mount_event(struct block_device *bdev, const char *fs_type) {
@@ -208,39 +208,39 @@ void handle_mount_event(struct block_device *bdev, const char *fs_type) {
     int ret;
 
     if (!bdev) {
-        pr_warn("SNAPSHOT: Device not yet mounted\n");
+        pr_warn("%s: Device not yet mounted\n", MODNAME);
         return;  
     }
 
     sdev = find_device_for_bdev(bdev);
     if (!sdev) {
-        pr_debug("SNAPSHOT: No registered device found for this mount\n");
+        pr_debug("%s: No registered device found for this mount\n", MODNAME);
         return;
     }
 
     if (!sdev->snapshot_active) {
-        pr_info("SNAPSHOT: Device %s registered but snapshot inactive\n", sdev->name);
+        pr_info("%s: Device %s registered but snapshot inactive\n", MODNAME, sdev->name);
         return;
     }
 
-    pr_info("SNAPSHOT: Mount event matched device: %s\n", sdev->name);
+    pr_info("%s: Mount event matched device: %s\n", MODNAME, sdev->name);
 
     /* Set bdev if not already set */
     spin_lock(&sdev->lock);
     if (!sdev->bdev) {
         sdev->bdev = bdev;
-        pr_info("SNAPSHOT: Attached bdev to device %s\n", sdev->name);
+        pr_info("%s: Attached bdev to device %s\n", MODNAME, sdev->name);
     }
     spin_unlock(&sdev->lock);
 
     /* Start a new session */
     ret = start_session_for_bdev(sdev, bdev, &timestamp, fs_type);
     if (ret) {
-        pr_err("SNAPSHOT: Failed to start session: %d\n", ret);
+        pr_err("%s: Failed to start session: %d\n", MODNAME, ret);
         return;
     }
 
-    pr_info("SNAPSHOT: Session queued for device: %s\n", sdev->name);
+    pr_info("%s: Session queued for device: %s\n", MODNAME, sdev->name);
 }
 
 #endif
@@ -268,7 +268,7 @@ static int mount_bdev_handler(struct kretprobe_instance *kp, struct pt_regs *reg
     
     /* Validate dentry structure */
     if (!dentry->d_sb) {
-        pr_err("SNAPSHOT: Invalid dentry - no superblock\n");
+        pr_err("%s: Invalid dentry - no superblock\n", MODNAME);
         return 0;
     }
     
@@ -280,7 +280,7 @@ static int mount_bdev_handler(struct kretprobe_instance *kp, struct pt_regs *reg
     
     /* Log mount info */
     if (dentry->d_sb->s_type && dentry->d_sb->s_type->name) {
-        pr_debug("SNAPSHOT: Mount detected - fs: %s, dev: %s\n",
+        pr_debug("%s: Mount detected - fs: %s, dev: %s\n", MODNAME, 
                 dentry->d_sb->s_type->name,
                 dentry->d_sb->s_bdev->bd_disk->disk_name);
     }
@@ -320,7 +320,7 @@ static int get_tree_bdev_ret(struct kretprobe_instance *ri, struct pt_regs *regs
         struct super_block *sb = c->fc->root->d_sb;
         fs_type = sb->s_type->name;
         if (sb->s_bdev) {
-            pr_debug("SNAPSHOT: Mount detected - fs: %s, dev: %s\n",
+            pr_debug("%s: Mount detected - fs: %s, dev: %s\n", MODNAME,
                 fs_type,
                 sb->s_bdev->bd_disk->disk_name);
             handle_mount_event(sb->s_bdev, fs_type);
@@ -347,7 +347,7 @@ int install_mount_hook(void)
     
     ret = register_kretprobe(&mount_bdev_kp);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to register kretprobe on mount: %d\n", ret);
+        pr_err("%s: Failed to register kretprobe on mount: %d\n", MODNAME, ret);
         return ret;
     }
     return 0;
@@ -359,7 +359,7 @@ int install_mount_hook(void)
 void remove_mount_hook(void)
 {
     unregister_kretprobe(&mount_bdev_kp);
-    pr_info("SNAPSHOT: Mount hook removed (missed %d probes)\n", 
+    pr_info("%s: Mount hook removed (missed %d probes)\n", MODNAME,
             mount_bdev_kp.nmissed);
 }
 
@@ -372,7 +372,7 @@ int install_get_tree_bdev_hook(void)
     
     ret = register_kretprobe(&get_tree_bdev_kp);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to register kretprobe on mount: %d\n", ret);
+        pr_err("%s: Failed to register kretprobe on mount: %d\n", MODNAME, ret);
         return ret;
     }
     return 0;
@@ -384,7 +384,7 @@ int install_get_tree_bdev_hook(void)
 void remove_get_tree_bdev_hook(void)
 {
     unregister_kretprobe(&get_tree_bdev_kp);
-    pr_info("SNAPSHOT: Mount hook removed (missed %d probes)\n", 
+    pr_info("%s: Mount hook removed (missed %d probes)\n", MODNAME,
         get_tree_bdev_kp.nmissed);
 }
 /**
@@ -398,18 +398,18 @@ int register_device(const char *devname) {
         return -ENOMEM;
     snapshot_device *new_dev;
     
-    pr_info("SNAPSHOT: Registering device: %s\n", devname);
+    pr_info("%s: Registering device: %s\n", MODNAME, devname);
 
     /* Validate user string */
     ret = validate_user_path(devname, key, PATH_MAX);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to validate path '%s': %d\n", devname, ret);
+        pr_err("%s: Failed to validate path '%s': %d\n", MODNAME, devname, ret);
         return -EINVAL;
     }
 
     /* Check if already registered */
     if (find_device(key)) {
-        pr_info("SNAPSHOT: Device %s already registered\n", key);
+        pr_info("%s: Device %s already registered\n", MODNAME, key);
         return -EEXIST;
     }
 
@@ -431,7 +431,7 @@ int register_device(const char *devname) {
     spin_lock(&devices_lock);
     list_add_tail_rcu(&new_dev->list, &active_devices);
     spin_unlock(&devices_lock);
-    pr_info("SNAPSHOT: Device registered as %s\n", key);
+    pr_info("%s: Device registered as %s\n", MODNAME, key);
     kfree(key);
     return 0;
 }
@@ -464,12 +464,12 @@ int unregister_device(const char *devname) {
             synchronize_rcu();
             kfree(dev);
             
-            pr_info("SNAPSHOT: Device unregistered: %s\n", key);
+            pr_info("%s: Device unregistered: %s\n", MODNAME, key);
             return 0;
         }
     }
     spin_unlock(&devices_lock);
-    pr_warn("SNAPSHOT: Device not found: %s\n", key);
+    pr_warn("%s: Device not found: %s\n", MODNAME, key);
     kfree(key);
     return -ENODEV;
 }

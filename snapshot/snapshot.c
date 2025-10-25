@@ -39,182 +39,7 @@ static atomic_t successful_search_counter = ATOMIC_INIT(0); //number of CPUs tha
 unsigned long *reference_offset = 0x0;
 
 void run_on_cpu(void *x) { //this is here just to enable a kprobe on it 
-    pr_info("SNAPSHOT: block device snapshot setup - running on CPU %d\n", smp_processor_id()); 
-}
-
-
-static bool snap_trace = true;             /* on/off trace for buffer cache*/
-static bool snap_trace_bio = false;        /* on/off trace for bio*/
-static int snap_dump_bytes = 64;           /* hexdump N bytes (0 = off) */
-static unsigned int snap_log_every = 1;    /* log 1 of every N events */
-
-static atomic64_t snap_evt_count = ATOMIC_INIT(0);
-
-typedef typeof(((struct bio *)0)->bi_opf) snap_opf_t;
-
-static inline struct address_space *snap_page_mapping(struct page *page)
-{
-#ifdef PAGE_MAPPING_FLAGS
-    return (struct address_space *)(
-        (unsigned long)READ_ONCE(page->mapping) & ~PAGE_MAPPING_FLAGS
-    );
-#else
-    return (struct address_space *)READ_ONCE(page->mapping);
-#endif
-}
-
-static const char *snap_op_name(unsigned int op)
-{
-    switch (op) {
-    case REQ_OP_READ:          return "READ";
-    case REQ_OP_WRITE:         return "WRITE";
-    case REQ_OP_FLUSH:         return "FLUSH";
-    case REQ_OP_DISCARD:       return "DISCARD";
-    case REQ_OP_WRITE_ZEROES:  return "WRITE_ZEROES";
-    case REQ_OP_ZONE_APPEND:   return "ZONE_APPEND";
-    case REQ_OP_ZONE_RESET:    return "ZONE_RESET";
-    default:                   return "OP?";
-    }
-}
-
-static void snap_flags_to_str(snap_opf_t opf, char *buf, size_t sz)
-{
-    int n = 0;
-#define ADD(_cond, _name) do { if (_cond) n += scnprintf(buf + n, sz - n, "%s" _name, n ? "|" : ""); } while (0)
-#ifdef REQ_SYNC
-    ADD(opf & REQ_SYNC, "SYNC");
-#endif
-#ifdef REQ_META
-    ADD(opf & REQ_META, "META");
-#endif
-#ifdef REQ_FUA
-    ADD(opf & REQ_FUA, "FUA");
-#endif
-#ifdef REQ_PREFLUSH
-    ADD(opf & REQ_PREFLUSH, "PREFLUSH");
-#endif
-#ifdef REQ_RAHEAD
-    ADD(opf & REQ_RAHEAD, "RAHEAD");
-#endif
-#ifdef REQ_BACKGROUND
-    ADD(opf & REQ_BACKGROUND, "BACKGROUND");
-#endif
-#ifdef REQ_NOWAIT
-    ADD(opf & REQ_NOWAIT, "NOWAIT");
-#endif
-#ifdef REQ_PRIO
-    ADD(opf & REQ_PRIO, "PRIO");
-#endif
-#undef ADD
-    if (n == 0) strscpy(buf, "-", sz);
-}
-
-static struct inode *snap_bio_inode(struct bio *bio)
-{
-    struct bio_vec bvec;
-    struct bvec_iter iter;
-
-    rcu_read_lock();
-    bio_for_each_segment(bvec, bio, iter) {
-        struct page *page = bvec.bv_page;
-        struct address_space *mapping = snap_page_mapping(page);
-        if (!mapping) continue;
-
-        if (READ_ONCE(mapping->host)) {
-            struct inode *inode = mapping->host;
-            rcu_read_unlock();
-            return inode;
-        }
-    }
-    rcu_read_unlock();
-    return NULL;
-}
-
-static void snap_decode_ioprio(u16 ioprio, unsigned int *classp, unsigned int *datap)
-{
-#ifdef IOPRIO_PRIO_CLASS
-    *classp = IOPRIO_PRIO_CLASS(ioprio);
-    *datap  = IOPRIO_PRIO_DATA(ioprio);
-#else
-    *classp = 0; *datap = 0;
-#endif
-}
-static void snap_log_submit_bio(const char *tag, struct bio *bio)
-{
-    const char *disk = (bio->bi_bdev && bio->bi_bdev->bd_disk) ? bio->bi_bdev->bd_disk->disk_name : "?";
-    snap_opf_t opf   = bio->bi_opf;
-    unsigned int op  = bio_op(bio);
-    char flags[96];  flags[0] = '\0';
-    unsigned int iclass = 0, idata = 0;
-    struct inode *inode = snap_bio_inode(bio);
-    unsigned long ino   = inode ? inode->i_ino : 0;
-    const char *fs_id   = (inode && inode->i_sb) ? inode->i_sb->s_id : "-";
-
-#ifdef CONFIG_BLOCK
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,9,0)
-    u16 ioprio = bio->bi_ioprio;
-#else
-    u16 ioprio = 0;
-#endif
-#else
-    u16 ioprio = 0;
-#endif
-
-    snap_flags_to_str(opf, flags, sizeof(flags));
-    snap_decode_ioprio(ioprio, &iclass, &idata);
-
-    pr_info_ratelimited(
-        "SNAPSHOT:%s dev=%s op=%s flags=%s sector=%llu bytes=%u pid=%d comm=%s ioprio=%u/%u hint=%u inode=%lu fs=%s end_io=%ps\n",
-        tag, disk, snap_op_name(op), flags,
-        (unsigned long long)bio->bi_iter.bi_sector,
-        bio->bi_iter.bi_size,
-        current->pid, current->comm,
-        iclass, idata,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,13,0)
-        bio->bi_write_hint,
-#else
-        0U,
-#endif
-        ino, fs_id, bio->bi_end_io
-    );
-
-    if (snap_trace_bio)
-        dump_stack();
-}
-
-static void snap_dump_bh(const char *tag, struct buffer_head *bh,
-                         sector_t sector_key, bool is_new)
-{
-    if (!snap_trace) return;
-    if (snap_log_every > 1) {
-        u64 c = atomic64_inc_return(&snap_evt_count);
-        if ((c % snap_log_every) != 0) return;
-    }
-
-    /* buffer_head state bits */
-    bool dirty    = test_bit(BH_Dirty,    &bh->b_state);
-    bool uptodate = test_bit(BH_Uptodate, &bh->b_state);
-    bool mapped   = test_bit(BH_Mapped,   &bh->b_state);
-    bool locked   = test_bit(BH_Lock,     &bh->b_state);
-
-    pr_info("SNAPSHOT:%s dev=%s blk=%llu (%zu bytes, %llu sectors) key=%llu "
-            "state{D=%d,U=%d,M=%d,L=%d} pid=%d comm=%s %s\n",
-            tag,
-            bh->b_bdev && bh->b_bdev->bd_disk ? bh->b_bdev->bd_disk->disk_name : "?",
-            (unsigned long long)bh->b_blocknr,
-            bh->b_size,
-            (unsigned long long)(bh->b_size >> 9),
-            (unsigned long long)sector_key,
-            dirty, uptodate, mapped, locked,
-            current->pid, current->comm,
-            is_new ? "NEW_DATA (about-to-be-written)"
-                   : "OLD_DATA (read-from-disk via __bread)");
-
-    if (snap_dump_bytes > 0 && bh->b_data) {
-        size_t dump = min_t(size_t, bh->b_size, (size_t)snap_dump_bytes);
-        print_hex_dump(KERN_INFO, "SNAPSHOT:bytes ",
-                       DUMP_PREFIX_OFFSET, 16, 1, bh->b_data, dump, true);
-    }
+    pr_info("%s: block device snapshot setup - running on CPU %d\n", MODNAME, smp_processor_id()); 
 }
 
 /* Workqueue for handling events */
@@ -305,27 +130,27 @@ static void cleanup_empty_session(snapshot_session *session)
 
     path = kmalloc(PATH_MAX, GFP_KERNEL);
     if (!path) {
-        pr_err("SNAPSHOT: kmalloc(PATH_MAX) failed in cleanup_empty_session\n");
+        pr_err("%s: kmalloc(PATH_MAX) failed in cleanup_empty_session\n", MODNAME);
         return;
     }
     snprintf(path, PATH_MAX, "%s/blocks.dat", session->snapshot_dir);
     if (snap_unlink_path(path))
-        pr_debug("SNAPSHOT: unlink failed : %s\n", path);
+        pr_debug("%s: unlink failed : %s\n", MODNAME, path);
 
     snprintf(path, PATH_MAX, "%s/blocks.map", session->snapshot_dir);
     if (snap_unlink_path(path))
-        pr_debug("SNAPSHOT: unlink failed : %s\n", path);
+        pr_debug("%s: unlink failed : %s\n", MODNAME, path);
 
     snprintf(path, PATH_MAX, "%s/meta.json", session->snapshot_dir);
     if (snap_unlink_path(path))
-        pr_debug("SNAPSHOT: unlink failed : %s\n", path);
+        pr_debug("%s: unlink failed : %s\n", MODNAME, path);
 
     /* remove finally the directory */
     if (snap_rmdir_path(session->snapshot_dir))
-        pr_debug("SNAPSHOT: rmdir failed : %s\n", session->snapshot_dir);
+        pr_debug("%s: rmdir failed : %s\n", MODNAME, session->snapshot_dir);
     
     kfree(path);
-    pr_info("SNAPSHOT: Removed empty snapshot dir %s\n", session->snapshot_dir);
+    pr_info("%s: Removed empty snapshot dir %s\n", MODNAME, session->snapshot_dir);
 }
 
 
@@ -352,7 +177,7 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp)
     atomic_set(&session->ref_cleanup, 1);
     atomic64_set(&session->blocks_count, 0);
     
-    pr_info("SNAPSHOT: Created session with timestamp %llu\n", timestamp);
+    pr_info("%s: Created session with timestamp %llu\n", MODNAME, timestamp);
     return session;
 }
 
@@ -367,8 +192,7 @@ void destroy_session(snapshot_session *session)
     if (!session)
         return;
     
-    pr_info("SNAPSHOT: Destroying session %llu\n", 
-            session->timestamp);
+    pr_info("%s: Destroying session %llu\n", MODNAME, session->timestamp);
     
     
     if (atomic64_read(&session->blocks_count) == 0) {
@@ -438,7 +262,7 @@ static int update_metadata_file(snapshot_session *session,
     mf = filp_open(pmeta, O_CREAT|O_WRONLY|O_TRUNC, 0644);
     if (IS_ERR(mf)) {
         ret = PTR_ERR(mf);
-        pr_err("SNAPSHOT: Failed to create meta.json: %d\n", ret);
+        pr_err("%s: Failed to create meta.json: %d\n", MODNAME, ret);
         goto out_free_meta;
     }
 
@@ -454,11 +278,11 @@ static int update_metadata_file(snapshot_session *session,
     #endif
     filp_close(mf, NULL);
     if (ret < 0) {
-        pr_err("SNAPSHOT: write meta.json failed: %d\n", ret);
+        pr_err("%s: write meta.json failed: %d\n", MODNAME, ret);
         goto out_free_meta;
     }
 
-    pr_info("SNAPSHOT: Updated %s\n", pmeta);
+    pr_info("%s: Updated %s\n", MODNAME, pmeta);
     ret = 0;
 
 out_free_meta:
@@ -496,7 +320,7 @@ static int create_files_and_meta_for_session(snapshot_session *session, const ch
     if (IS_ERR(session->map_file)) {
         err = PTR_ERR(session->map_file);
         session->map_file = NULL;
-        pr_err("SNAPSHOT: Failed to create blocks.map: %d\n", err);
+        pr_err("%s: Failed to create blocks.map: %d\n", MODNAME, err);
         goto cleanup;
     }
 
@@ -507,14 +331,14 @@ static int create_files_and_meta_for_session(snapshot_session *session, const ch
         filp_close(session->map_file, NULL);
         session->map_file = NULL;
         session->data_file = NULL;
-        pr_err("SNAPSHOT: Failed to create blocks.dat: %d\n", err);
+        pr_err("%s: Failed to create blocks.dat: %d\n", MODNAME, err);
         goto cleanup;
     }
 
     /* Create initial metadata */
     update_metadata_file(session, raw_devname, fs_type);
 
-    pr_info("SNAPSHOT: Created snapshot files in %s\n", session->snapshot_dir);
+    pr_info("%s: Created snapshot files in %s\n", MODNAME, session->snapshot_dir);
 
 cleanup:
     kfree(pmap);
@@ -570,7 +394,7 @@ static int create_snapshot_subdirectory(snapshot_session *session,
     /* Create the directory */
     dentry = kern_path_create(AT_FDCWD, path, &parent_path, LOOKUP_DIRECTORY);
     if (IS_ERR(dentry)) {
-        pr_err("SNAPSHOT: kern_path_create failed: %ld\n", PTR_ERR(dentry));
+        pr_err("%s: kern_path_create failed: %ld\n", MODNAME, PTR_ERR(dentry));
         return PTR_ERR(dentry);
     }
     
@@ -582,24 +406,25 @@ static int create_snapshot_subdirectory(snapshot_session *session,
 #endif
     
     if (err && err != -EEXIST) {
-        pr_err("SNAPSHOT: mkdir failed: %d\n", err);
+        pr_err("%s: mkdir failed: %d\n", MODNAME, err);
     } else {
         /* Store the path in the session */
         mutex_lock(&session->dir_mtx);
         strscpy(session->snapshot_dir, path, PATH_MAX);
         mutex_unlock(&session->dir_mtx);
         
-        pr_info("SNAPSHOT: Directory created: %s\n", path);
+        pr_info("%s: Directory created: %s\n", MODNAME, path);
         err = 0;
     }
     err = create_files_and_meta_for_session(session, raw_devname, fs_type);
     if (err) {
-        pr_err("SNAPSHOT: creation/open files/meta failed: %d\n", err);
+        pr_err("%s: creation/open files/meta failed: %d\n", MODNAME, err);
     }
     done_path_create(&parent_path, dentry);
     kfree(path);
     return err;
 }
+
 static void cow_mem_worker(struct work_struct *w)
 {
     struct cow_mem_work *mw = container_of(w, struct cow_mem_work, work);
@@ -608,7 +433,7 @@ static void cow_mem_worker(struct work_struct *w)
     ssize_t wrc;
 
     if (!session->data_file || !session->map_file) {
-        pr_warn_ratelimited("SNAPSHOT: no files open, drop key=%llu\n",
+        pr_warn_ratelimited("%s: no files open, drop key=%llu\n", MODNAME,
                             (unsigned long long)mw->sector_key);
         goto out;
     }
@@ -627,7 +452,7 @@ static void cow_mem_worker(struct work_struct *w)
 #endif
     
     if (wrc != mw->size) {
-        pr_warn_ratelimited("SNAPSHOT: data write incomplete (%zd/%u)\n", wrc, mw->size);
+        pr_warn_ratelimited("%s: data write incomplete (%zd/%u)\n", MODNAME, wrc, mw->size);
     }
 
     /* Write record to blocks.map */
@@ -647,13 +472,13 @@ static void cow_mem_worker(struct work_struct *w)
 #endif
 
     if (wrc != sizeof(rec)) {
-        pr_warn_ratelimited("SNAPSHOT: map write incomplete (%zd/%zu)\n", wrc, sizeof(rec));
+        pr_warn_ratelimited("%s: map write incomplete (%zd/%zu)\n", MODNAME, wrc, sizeof(rec));
     }
 
     /* Update block counter */
     atomic64_inc(&session->blocks_count);
 
-    pr_info("SNAPSHOT: COW saved sector=%llu size=%u offset=%llu (total_blocks=%lld)\n",
+    pr_info("%s: COW saved sector=%llu size=%u offset=%llu (total_blocks=%lld)\n", MODNAME,
             (unsigned long long)rec.sector, rec.size,
             (unsigned long long)rec.offset,
             atomic64_read(&session->blocks_count));
@@ -716,7 +541,7 @@ static void flush_pending_blocks(snapshot_session *ses)
 
         if (!xa_is_value(entry)) {
             if (enqueue_cow_mem(ses, (sector_t)index, entry, COW_BLK_SZ) <= 0) {
-                pr_warn("SNAPSHOT: flush enqueue failed key=%lu\n", index);
+                pr_warn("%s: flush enqueue failed key=%lu\n", MODNAME, index);
             }
         }
     }
@@ -736,19 +561,19 @@ static void mount_work_handler(struct work_struct *work) {
     sdev = mw->sdev;
     
     if (!sdev) {
-        pr_err("SNAPSHOT: No device in mount_work\n");
+        pr_err("%s: No device in mount_work\n", MODNAME);
         goto cleanup;
     }
     if (mw->action == SNAP_WORK_START) {
 
         /* Check if snapshot is still active */
         if (!sdev->snapshot_active) {
-            pr_info("SNAPSHOT: Snapshot no longer active for: %s\n", sdev->name);
+            pr_info("%s: Snapshot no longer active for: %s\n", MODNAME, sdev->name);
             goto cleanup;
         }
 
         if (!mw->bdev || !mw->bdev->bd_disk) {
-            pr_info("SNAPSHOT: Device no longer valid\n");
+            pr_info("%s: Device no longer valid\n", MODNAME);
             goto cleanup;
         }
 
@@ -756,7 +581,7 @@ static void mount_work_handler(struct work_struct *work) {
         timestamp = ktime_get_real_ns();
         session = create_session(sdev, timestamp);
         if (!session) {
-            pr_err("SNAPSHOT: Failed to create session for: %s\n", sdev->name);
+            pr_err("%s: Failed to create session for: %s\n", MODNAME, sdev->name);
             goto cleanup;
         }
         /* Add session to device */
@@ -772,7 +597,7 @@ static void mount_work_handler(struct work_struct *work) {
         /* Create snapshot subdirectory - use the device name from sdev */
         ret = create_snapshot_subdirectory(session, sdev->name, mw->fs_type);
         if (ret) {
-            pr_err("SNAPSHOT: Failed to create directory: %d\n", ret);
+            pr_err("%s: Failed to create directory: %d\n", MODNAME, ret);
             destroy_session(session);
             goto cleanup;
         }
@@ -781,11 +606,10 @@ static void mount_work_handler(struct work_struct *work) {
         smp_wmb();  // Memory barrier
 
         flush_pending_blocks(session);
-        pr_info("SNAPSHOT: Session %llu started\n",
-            timestamp);
+        pr_info("%s: Session %llu started\n", MODNAME, timestamp);
 
     } else { 
-        pr_info("SNAPSHOT: Unmount work -> stopping sessions for %s\n", sdev->name);
+        pr_info("%s: Unmount work -> stopping sessions for %s\n", MODNAME, sdev->name);
         stop_sessions_for_bdev(sdev);
     }
     cleanup:
@@ -814,7 +638,7 @@ int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64
 
     /* Queue the work */
     if (!queue_work(snapshot_wq, &mw->work)) {
-        pr_err("SNAPSHOT: Failed to queue mount work\n");
+        pr_err("%s: Failed to queue mount work\n", MODNAME);
         kfree(mw);
         return -EAGAIN;
     }
@@ -836,7 +660,7 @@ int stop_sessions_for_bdev(snapshot_device *sdev)
     if (!sdev || !sdev->bdev)
         return -EINVAL;
 
-    pr_info("SNAPSHOT: Stopping all sessions for: %s\n", sdev->name);
+    pr_info("%s: Stopping all sessions for: %s\n",  MODNAME, sdev->name);
 
     /* Get active session*/
     rcu_read_lock();
@@ -892,8 +716,7 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
 
     /* Skip if already saved */
     if (xa_load(&ses->saved_blocks, key)) {
-        pr_info("SNAPSHOT: Block already saved key=%llu\n", 
-                (unsigned long long)key);
+        pr_info("%s: Block already saved key=%llu\n",  MODNAME, (unsigned long long)key);
         return 0;
     }
     /*Write confirmed, wen can delete the key from staged*/
@@ -903,7 +726,7 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
     /*Take old data and replace data with a sentinel*/
     void *prev = xa_store(&ses->pending_block, key, xa_mk_value(1), GFP_ATOMIC);
     if (xa_err(prev)) {
-        pr_warn_ratelimited("SNAPSHOT: xa_store err=%ld key=%llu\n",
+        pr_warn_ratelimited("%s: xa_store err=%ld key=%llu\n", MODNAME,
                             PTR_ERR(prev), (unsigned long long)key);
         return 0;
     }
@@ -917,10 +740,10 @@ static int write_dirty_buffer_handler(struct kprobe *p, struct pt_regs *regs)
         if (xa_err(rb)) {
             kfree(prev);
         }
-        pr_warn_ratelimited("SNAPSHOT: enqueue failed key=%llu err=%d\n",
+        pr_warn_ratelimited("%s: enqueue failed key=%llu err=%d\n", MODNAME,
                             (unsigned long long)key, ret);
     } else {
-        pr_info("SNAPSHOT: COW confirmed and queued blk=%llu key=%llu\n",
+        pr_info("%s: COW confirmed and queued blk=%llu key=%llu\n", MODNAME,
                 (unsigned long long)bh->b_blocknr, (unsigned long long)key);
     }
     return 0;
@@ -976,7 +799,6 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     //snap_dump_bh("COW_CAPTURE", bh, key, false);
     /* If no blocks are currently staged for this key, exit. No write operation intercepted. */
     if (!xa_load(&ses->staged_blocks, key)){
-        pr_info("SNAPSHOT: No write occurs. Skipping the copy of old blocks");
         return 0;
     }
     if (xa_load(&ses->saved_blocks, key) || xa_load(&ses->pending_block, key)) {
@@ -994,7 +816,7 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     if (xa_insert(&ses->pending_block, key, copy, GFP_ATOMIC)) {
         kfree(copy);
     } else {
-        pr_info("SNAPSHOT: Block cached in pending blocks blk=%llu size=%zu key=%llu\n",
+        pr_info("%s: Block cached in pending blocks blk=%llu size=%zu key=%llu\n", MODNAME,
                 (unsigned long long)bh->b_blocknr,
                 (size_t)bh->b_size,
                 (unsigned long long)key);
@@ -1036,7 +858,7 @@ static int kill_block_super_entry(struct kprobe *p, struct pt_regs *regs)
         return -EAGAIN;
     }
 
-    pr_info("SNAPSHOT: kill_block_super() detected for %s\n",
+    pr_info("%s: kill_block_super() detected for %s\n", MODNAME,
         sdev->name);
 
     return 0;
@@ -1059,7 +881,7 @@ int install_write_hook(void)
     
     ret = register_kprobe(&write_dirty_buffer_kp);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to register kprobe on write: %d\n", ret);
+        pr_err("%s: Failed to register kprobe on write: %d\n", MODNAME, ret);
         return ret;
     }
     return 0;
@@ -1207,7 +1029,7 @@ static int cow_capture(struct file *file,
     blksize_bits = sb->s_blocksize_bits;
 
     if (blksize > PAGE_SIZE){
-        pr_info("SNAPSHOT: Block size > Page Size. Not implemented");
+        pr_info("%s: Block size > Page Size. Not implemented", MODNAME);
         return 0;
     }
         
@@ -1299,7 +1121,7 @@ static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
             nsched = cow_schedule(file, start_offset, count, ses);
 
         if (ncap || nsched) {
-            pr_info("SNAPSHOT: vfs_write preimage: captured=%d scheduled=%d inode=%lu pid=%d comm=%s\n",
+            pr_info("%s: vfs_write preimage: captured=%d scheduled=%d inode=%lu pid=%d comm=%s\n", MODNAME,
                     ncap, nsched, file->f_inode->i_ino, current->pid, current->comm);
         }
 
@@ -1323,8 +1145,8 @@ static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
             if (!xa_load(&ses->saved_blocks, key)) {
                 xa_store(&ses->staged_blocks, key, xa_mk_value(1), GFP_ATOMIC);
                 
-                pr_info("SNAPSHOT: vfs_write marks staged_blocks with key=%llu "
-                        "(file=%s pid=%d)\n",
+                pr_info("%s: vfs_write marks staged_blocks with key=%llu (file=%s pid=%d)\n", 
+                        MODNAME,
                         (unsigned long long)key,
                         file->f_path.dentry->d_name.name,
                         current->pid);
@@ -1347,10 +1169,9 @@ int install_vfs_write_hook(bool use_bio_layer)
     g_use_bio_layer = use_bio_layer;
     int ret = register_kprobe(&vfs_write_kp);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to register kprobe on vfs_write: %d\n", ret);
+        pr_err("%s: Failed to register kprobe on vfs_write: %d\n", MODNAME, ret);
         return ret;
     }
-    pr_info("SNAPSHOT: vfs_write hook installed\n");
     return 0;
 }
 /**
@@ -1359,7 +1180,7 @@ int install_vfs_write_hook(bool use_bio_layer)
 void remove_vfs_write_hook(void)
 {
     unregister_kprobe(&vfs_write_kp);
-    pr_info("SNAPSHOT: vfs_write hook removed\n");
+    pr_info("%s: vfs_write hook removed\n", MODNAME);
 }
 
 /*
@@ -1373,7 +1194,7 @@ static int the_search(struct kprobe *kp, struct pt_regs *regs)
         temp -= 1;
         if ((unsigned long)__this_cpu_read(*temp) == (unsigned long)kp) {
             atomic_inc(&successful_search_counter);
-            printk(KERN_DEBUG "SNAPSHOT: found kprobe context pointer at %p\n", temp);
+            printk(KERN_DEBUG "%s: found kprobe context pointer at %p\n", MODNAME, temp);
             reference_offset = temp;
             break;
         }
@@ -1396,20 +1217,20 @@ int snapshot_kprobe_setup_init(void)
 
     ret = register_kprobe(&setup_probe);
     if (ret < 0) {
-        pr_info("SNAPSHOT: hook init failed for the init kprobe setup, returned %d\n", ret);
+        pr_info("%s: hook init failed for the init kprobe setup, returned %d\n", MODNAME, ret);
         return ret;
     }
     get_cpu();
     smp_call_function((smp_call_func_t)run_on_cpu, NULL, 1);
 
     if (atomic_read(&successful_search_counter) < num_online_cpus() - 1 ) {
-        pr_info("SNAPSHOT: read hook load failed - number of setup CPUs is %d - number of remote online CPUs is %d\n", atomic_read(&successful_search_counter), num_online_cpus() - 1);
+        pr_info("%s: read hook load failed - number of setup CPUs is %d - number of remote online CPUs is %d\n", MODNAME, atomic_read(&successful_search_counter), num_online_cpus() - 1);
         put_cpu();
         unregister_kprobe(&setup_probe);
         return -1; 
     }
     if (reference_offset == 0x0){
-        pr_info("SNAPSHOT: inconsistent value found for reference offset\n");
+        pr_info("%s: inconsistent value found for reference offset\n", MODNAME);
         put_cpu();
         unregister_kprobe(&setup_probe);
         return -1;
@@ -1425,7 +1246,7 @@ int snapshot_kprobe_setup_init(void)
  */
 void remove_setup_probe(void){
     unregister_kprobe(&setup_probe);
-    pr_info("SNAPSHOT: Setup probe removed\n");
+    pr_info("%s: Setup probe removed\n", MODNAME);
 }
 
 /**
@@ -1437,7 +1258,7 @@ int install_read_hook(void)
     
     ret = register_kretprobe(&__bread_gfp_kp);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to register kretprobe on read: %d\n", ret);
+        pr_err("%s: Failed to register kretprobe on read: %d\n", MODNAME, ret);
         return ret;
     }
     return 0;
@@ -1449,7 +1270,7 @@ int install_read_hook(void)
 void remove_read_hook(void)
 {
     unregister_kretprobe(&__bread_gfp_kp);
-    pr_info("SNAPSHOT: Read hook removed (missed %d probes)\n", 
+    pr_info("%s: Read hook removed (missed %d probes)\n", MODNAME,
         __bread_gfp_kp.nmissed);
 }
 
@@ -1468,7 +1289,7 @@ int install_unmount_hook(void)
     
     ret = register_kprobe(&kill_block_super_kp);
     if (ret < 0) {
-        pr_err("SNAPSHOT: Failed to register kprobe on unmount: %d\n", ret);
+        pr_err("%s: Failed to register kprobe on unmount: %d\n", MODNAME, ret);
         return ret;
     }
     return 0;
@@ -1491,17 +1312,17 @@ int snapshot_init(void)
     /* Create workqueue for handling mount/unmount events */
     snapshot_wq = alloc_workqueue("snapshot_wq", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
     if (!snapshot_wq) {
-        pr_err("SNAPSHOT: Failed to create workqueue\n");
+        pr_err("%s: Failed to create workqueue\n", MODNAME);
         return -ENOMEM;
     }
 
     snapshot_bio_wq = alloc_workqueue("snapshot_bio_kp_wq", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
     if (!snapshot_bio_wq){
-        pr_err("SNAPSHOT: Failed to create bio workqueue\n");
+        pr_err("%s: Failed to create bio workqueue\n", MODNAME);
         return -ENOMEM;
     } 
     
-    pr_info("SNAPSHOT: Subsystem initialized\n");
+    pr_info("%s: Subsystem initialized\n", MODNAME);
     return 0;
 }
 
@@ -1522,5 +1343,5 @@ void snapshot_exit(void)
         snapshot_bio_wq = NULL;
     }
     
-    pr_info("SNAPSHOT: Subsystem cleaned up\n");
+    pr_info("%s: Subsystem cleaned up\n", MODNAME);
 }
