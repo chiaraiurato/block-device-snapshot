@@ -26,7 +26,7 @@
  * @blocks_count: Count of blocks saved in this session
  * @list: List head for linking sessions
  * @ref_cleanup: Reference counter for safe cleanup after a device is unmonted
- * @ref_files_ready: Reference counter to acknowledge file creation and readiness (0 not ready, 1 ready)
+ * @cow_wq: workqueue for handling blocks and its persistence
  * @map_file: File pointer for blocks.map
  * @data_file: File pointer for blocks.dat
  * @map_pos: Current write position in blocks.map
@@ -43,7 +43,7 @@ typedef struct {
     atomic64_t blocks_count;
     struct list_head list;
     atomic_t ref_cleanup;
-    atomic_t ref_files_ready;
+    struct workqueue_struct *cow_wq;
     struct file *map_file;        
     struct file *data_file;       
     loff_t map_pos;
@@ -59,6 +59,7 @@ typedef struct {
  * @rcu: RCU head used for lockless readers
  * @lock: Spinlock to protect access to sessions list
  * @sessions: List of active sessions
+ * @active_session: Pointer to active session
  */
 typedef struct snapshot_device {
     char name[MAX_DEV_LEN];

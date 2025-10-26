@@ -44,7 +44,6 @@ void run_on_cpu(void *x) { //this is here just to enable a kprobe on it
 
 /* Workqueue for handling events */
 static struct workqueue_struct *snapshot_wq;
-static struct workqueue_struct *snapshot_bio_wq;
 
 struct snapshot_rec {
     u64 sector;   /* key (512B) */
@@ -187,12 +186,20 @@ snapshot_session *create_session(snapshot_device *sdev, u64 timestamp)
 void destroy_session(snapshot_session *session)
 {
     unsigned long index;
+    struct workqueue_struct *cow_wq;
     void *entry;
     
     if (!session)
         return;
     
     pr_info("%s: Destroying session %llu\n", MODNAME, session->timestamp);
+
+    cow_wq = xchg(&session->cow_wq, NULL);
+    if (cow_wq) {
+        flush_workqueue(cow_wq);
+        pr_info("%s: All cow completed, destroying workqueue...\n", MODNAME);
+        destroy_workqueue(cow_wq);
+    }
     
     
     if (atomic64_read(&session->blocks_count) == 0) {
@@ -433,8 +440,7 @@ static void cow_mem_worker(struct work_struct *w)
     ssize_t wrc;
 
     if (!session->data_file || !session->map_file) {
-        pr_warn_ratelimited("%s: no files open, drop key=%llu\n", MODNAME,
-                            (unsigned long long)mw->sector_key);
+        pr_err("%s: CRITICAL: Files NULL in cow worker (this should never happen)\n", MODNAME);
         goto out;
     }
 
@@ -502,6 +508,14 @@ static int enqueue_cow_mem(snapshot_session *session,
                            unsigned int size)
 {
     struct cow_mem_work *mw;
+    struct workqueue_struct *wq;
+
+    wq = READ_ONCE(session->cow_wq);
+    if (!wq) {
+        pr_info("%s: Cow workqueue not ready\n", 
+                 MODNAME);
+        return 0; 
+    }
 
     /* Allocate work structure */
     mw = kzalloc(sizeof(*mw), GFP_ATOMIC);
@@ -517,7 +531,7 @@ static int enqueue_cow_mem(snapshot_session *session,
     //before queueing the work we need to increment the ref count
     get_session(session);
     /* Queue work */
-    if (!queue_work(snapshot_wq, &mw->work)) {
+    if (!queue_work(wq, &mw->work)) {
         //release the ref count if failed
         put_session(session);
         kfree(mw);
@@ -592,18 +606,19 @@ static void mount_work_handler(struct work_struct *work) {
         /*Assign active session for device*/
         rcu_assign_pointer(sdev->active_session, session); 
 
-        atomic_set(&session->ref_files_ready, 0);
-
         /* Create snapshot subdirectory - use the device name from sdev */
         ret = create_snapshot_subdirectory(session, sdev->name, mw->fs_type);
         if (ret) {
-            pr_err("%s: Failed to create directory: %d\n", MODNAME, ret);
-            destroy_session(session);
-            goto cleanup;
+            goto error;
         }
 
-        atomic_set(&session->ref_files_ready, 1);
-        smp_wmb();  // Memory barrier
+        session->cow_wq = alloc_workqueue("snapshot_cow", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+        if (!session->cow_wq) {
+            pr_err("%s: Failed to create I/O workqueue\n", MODNAME);
+            if (session->data_file) filp_close(session->data_file, NULL);
+            if (session->map_file) filp_close(session->map_file, NULL);
+            goto error;
+        } 
 
         flush_pending_blocks(session);
         pr_info("%s: Session %llu started\n", MODNAME, timestamp);
@@ -612,6 +627,14 @@ static void mount_work_handler(struct work_struct *work) {
         pr_info("%s: Unmount work -> stopping sessions for %s\n", MODNAME, sdev->name);
         stop_sessions_for_bdev(sdev);
     }
+    return;
+    error:
+        spin_lock(&sdev->lock);
+        RCU_INIT_POINTER(sdev->active_session, NULL);
+        list_del_init(&session->list);
+        spin_unlock(&sdev->lock);
+        synchronize_rcu();
+        destroy_session(session);
     cleanup:
         kfree(mw);
 }
@@ -654,7 +677,6 @@ int start_session_for_bdev(snapshot_device *sdev, struct block_device *bdev, u64
  */
 int stop_sessions_for_bdev(snapshot_device *sdev)
 {
-    LIST_HEAD(to_free);
     snapshot_session *session;
     /* Return if there isn't a device attached*/
     if (!sdev || !sdev->bdev)
@@ -1116,9 +1138,8 @@ static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
         preempt_disable();
         __this_cpu_write(*kprobe_cpu, (unsigned long)&the_probe);
 
-        /* If the files are ready we can schedule the persistence to disk */
-        if (atomic_read(&ses->ref_files_ready))
-            nsched = cow_schedule(file, start_offset, count, ses);
+        
+        nsched = cow_schedule(file, start_offset, count, ses);
 
         if (ncap || nsched) {
             pr_info("%s: vfs_write preimage: captured=%d scheduled=%d inode=%lu pid=%d comm=%s\n", MODNAME,
@@ -1316,12 +1337,6 @@ int snapshot_init(void)
         return -ENOMEM;
     }
 
-    snapshot_bio_wq = alloc_workqueue("snapshot_bio_kp_wq", WQ_HIGHPRI | WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
-    if (!snapshot_bio_wq){
-        pr_err("%s: Failed to create bio workqueue\n", MODNAME);
-        return -ENOMEM;
-    } 
-    
     pr_info("%s: Subsystem initialized\n", MODNAME);
     return 0;
 }
@@ -1336,12 +1351,5 @@ void snapshot_exit(void)
         destroy_workqueue(snapshot_wq);
         snapshot_wq = NULL;
     }
-
-    if (snapshot_bio_wq) {
-        flush_workqueue(snapshot_bio_wq);
-        destroy_workqueue(snapshot_bio_wq);
-        snapshot_bio_wq = NULL;
-    }
-    
     pr_info("%s: Subsystem cleaned up\n", MODNAME);
 }

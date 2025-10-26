@@ -48,3 +48,4 @@ mount/
 *.symtypes
 *.bin
 *.dtb
+restore/restore.out
