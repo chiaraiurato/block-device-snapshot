@@ -1,8 +1,3 @@
-// Snapshot restore service for /snapshot/<sanitized>_<timestamp> sessions.
-// Matches the on-disk format written by your kernel module:
-//   blocks.map: repeated records { u64 sector; u32 size; u64 offset } (packed)
-//   blocks.dat: raw block payloads appended; 'offset' indexes into this file.
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -127,16 +122,75 @@ static void print_table(const session_t *list, size_t n) {
         printf("%3zu | %-25s | %s\n", i+1, list[i].dirname, when);
     }
 }
-// Check if a regular file is the backing file for any active loop device
-static bool is_loop_backing_file_in_use(const char *filepath) {
-    DIR *dir = opendir("/sys/block");
-    if (!dir) return false;
 
-    bool in_use = false;
+static bool is_dev_path_mounted(const char *dev_path) {
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (!fp) {
+        perror("fopen(/proc/mounts)");
+        return false;
+    }
+
+    bool mounted = false;
+    char line[PATH_MAX * 2];
+    
+    while (fgets(line, sizeof(line), fp)) {
+        char mount_dev[PATH_MAX];
+        if (sscanf(line, "%s", mount_dev) != 1) continue;
+        
+        if (strcmp(mount_dev, dev_path) == 0) {
+            mounted = true;
+            break;
+        }
+    }
+    
+    fclose(fp);
+    return mounted;
+}
+
+static bool is_block_device_mounted(dev_t rdev) {
+    FILE *fp = fopen("/proc/mounts", "r");
+    if (!fp) {
+        perror("fopen(/proc/mounts)");
+        return false;
+    }
+
+    bool mounted = false;
+    char line[PATH_MAX * 2];
+    
+    while (fgets(line, sizeof(line), fp)) {
+        char mount_dev[PATH_MAX];
+        if (sscanf(line, "%s", mount_dev) != 1) continue;
+        
+        struct stat mount_st;
+        if (stat(mount_dev, &mount_st) == 0 && S_ISBLK(mount_st.st_mode)) {
+            if (mount_st.st_rdev == rdev) {
+                mounted = true;
+                break;
+            }
+        }
+    }
+    
+    fclose(fp);
+    return mounted;
+}
+
+static bool find_loop_device_for_file(const char *filepath, char *loop_dev_out, size_t out_size) {
+    char canonical[PATH_MAX];
+    if (!realpath(filepath, canonical)) {
+        perror("realpath");
+        return false;
+    }
+
+    DIR *dir = opendir("/sys/block");
+    if (!dir) {
+        perror("opendir(/sys/block)");
+        return false;
+    }
+
+    bool found = false;
     struct dirent *de;
     
     while ((de = readdir(dir))) {
-        // Look for loopN directories
         if (strncmp(de->d_name, "loop", 4) != 0) continue;
 
         char backing_file_path[PATH_MAX];
@@ -148,15 +202,14 @@ static bool is_loop_backing_file_in_use(const char *filepath) {
 
         char backing[PATH_MAX];
         if (fgets(backing, sizeof(backing), fp)) {
-            // Remove trailing newline
             size_t len = strlen(backing);
             if (len > 0 && backing[len-1] == '\n') {
                 backing[len-1] = '\0';
             }
 
-            // Compare paths
-            if (strcmp(backing, filepath) == 0) {
-                in_use = true;
+            if (strcmp(backing, canonical) == 0) {
+                snprintf(loop_dev_out, out_size, "/dev/%s", de->d_name);
+                found = true;
                 fclose(fp);
                 break;
             }
@@ -165,75 +218,32 @@ static bool is_loop_backing_file_in_use(const char *filepath) {
     }
 
     closedir(dir);
-    return in_use;
+    return found;
 }
 
 static bool is_device_mounted(const char *devname) {
     struct stat target_st;
     if (stat(devname, &target_st) != 0) {
         perror("stat(devname)");
-        return false; // If we can't stat it, allow restore attempt
-    }
-
-    bool is_block = S_ISBLK(target_st.st_mode);
-    bool is_regular = S_ISREG(target_st.st_mode);
-
-    if (!is_block && !is_regular) {
-        fprintf(stderr, "Warning: '%s' is neither a block device nor regular file\n", devname);
         return false;
     }
 
-    FILE *fp = fopen("/proc/mounts", "r");
-    if (!fp) {
-        perror("fopen(/proc/mounts)");
+    if (S_ISBLK(target_st.st_mode)) {
+        // Block device: we can check directly in /proc/mounts
+        return is_block_device_mounted(target_st.st_rdev);
+        
+    } else if (S_ISREG(target_st.st_mode)) {
+        // Regular file: find loop device associated and then search again in /proc/mounts
+        char loop_dev[PATH_MAX];
+        if (!find_loop_device_for_file(devname, loop_dev, sizeof(loop_dev))) {
+            return false;
+        }
+        return is_dev_path_mounted(loop_dev);
+        
+    } else {
+        fprintf(stderr, "Warning: '%s' is neither block device nor regular file\n", devname);
         return false;
     }
-
-    char line[PATH_MAX * 2];
-    char real_devname[PATH_MAX];
-    bool mounted = false;
-
-    // Resolve symlinks for target
-    if (realpath(devname, real_devname) == NULL) {
-        strncpy(real_devname, devname, sizeof(real_devname) - 1);
-        real_devname[PATH_MAX - 1] = '\0';
-    }
-
-    while (fgets(line, sizeof(line), fp)) {
-        char mount_dev[PATH_MAX];
-        if (sscanf(line, "%s", mount_dev) != 1) continue;
-
-        // For block devices: compare device numbers
-        if (is_block) {
-            struct stat mount_st;
-            if (stat(mount_dev, &mount_st) == 0 && S_ISBLK(mount_st.st_mode)) {
-                if (mount_st.st_rdev == target_st.st_rdev) {
-                    mounted = true;
-                    break;
-                }
-            }
-        }
-
-        // For regular files (loop backing files): compare resolved paths
-        if (is_regular) {
-            char real_mount[PATH_MAX];
-            if (realpath(mount_dev, real_mount) != NULL) {
-                if (strcmp(real_mount, real_devname) == 0) {
-                    mounted = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    fclose(fp);
-
-    // Additional check for regular files: check if used by any loop device
-    if (!mounted && is_regular) {
-        mounted = is_loop_backing_file_in_use(real_devname);
-    }
-
-    return mounted;
 }
 
 
