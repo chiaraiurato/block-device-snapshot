@@ -1173,6 +1173,18 @@ static int vfs_write_entry(struct kprobe *p, struct pt_regs *regs)
                         current->pid);
             }
         }
+        /*Stage also inode block*/
+        struct super_block *sb = file->f_inode->i_sb;
+        const unsigned int blksize_sect = sb->s_blocksize >> 9;
+        sector_t inode_key = (sector_t)1 * blksize_sect;
+        if (!xa_load(&ses->saved_blocks, inode_key) &&
+            !xa_load(&ses->pending_block, inode_key)) {
+            xa_store(&ses->staged_blocks, inode_key, xa_mk_value(1), GFP_ATOMIC);
+            pr_info("%s: vfs_write staged INODE key=%llu (file=%s pid=%d)\n",
+                    MODNAME, (unsigned long long)inode_key,
+                    file->f_path.dentry->d_name.name, current->pid);
+        }
+        
         return 0;
     }
 }
