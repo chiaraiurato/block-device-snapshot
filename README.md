@@ -52,6 +52,7 @@ When a snapshot session is active, data is stored in the `/snapshot` directory o
 
 *   Linux Kernel Headers (e.g., `linux-headers-$(uname -r)`)
 *   `make`, `gcc`, `build-essential`
+*    Tested On Linux kernel: 6.11.0-21-generic
 
 ### Configuration
 
@@ -84,28 +85,28 @@ This command will:
 
 The following steps demonstrate a typical workflow using a loop device.
 
-1.  **Create a Test Device**: Create a 100MB file-backed block device formatted with ext4.
+1.  **Create a Test Device**: Create a 100MB file-backed block device with:
 
     ```bash
-    make create-ext4
+    make create-singlefilefs
     ```
 
 2.  **Activate Snapshotting**: Before mounting, tell the module to monitor the device.
 
     ```bash
-    ./user.out activate </path/to/ext4> <password>
+    ./user.out activate <devname> <password>
     ```
 
-4.  **Mount the Device**: Mount the loop device. This will trigger the kprobe hook, and a new snapshot session will begin.
+4.  **Mount the Block Device**: Mount the loop device. This will trigger the kprobe hook, and a new snapshot session will begin.
 
     ```bash
-    make mount-ext4
+    make mount-fs
     ```
 
 5.  **Modify Files**: Create or modify files on the mounted filesystem. Every overwritten block's original content will be saved.
 
     ```bash
-    echo "This is a test." | sudo tee ./mount/my_test_file.txt
+    echo "This is a test." | sudo tee ./mount/the-file
     ```
 
 6.  **Unmount the Device**: Unmounting stops the snapshot session and finalizes the snapshot files.
@@ -122,14 +123,14 @@ The following steps demonstrate a typical workflow using a loop device.
     *   Run the utility, providing the path to the original device image. It will present an interactive menu of available snapshots.
 
         ```bash
-        sudo ./restore/restore.out </path/to/ext4>
+        sudo ./restore/restore.out <devname>
         ```
     *   Follow the on-screen prompts to select a snapshot and confirm the restore operation.
 
 8.  **Deactivate Snapshotting**: To prevent the module from creating new snapshots on future mounts of the device, run:
 
     ```bash
-    ./user.out deactivate </path/to/ext4> <password>
+    ./user.out deactivate <devname> <password>
     ```
 
 9.  **Cleanup**: Unload the modules and remove all build artifacts.

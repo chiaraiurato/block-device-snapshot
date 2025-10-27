@@ -66,7 +66,7 @@ mount:
 	echo "[mount] loading the_block-device-snapshot.ko"; \
 	sudo insmod the_block-device-snapshot.ko \
 		the_syscall_table=$$SYS_CALL_TABLE \
-		the_snapshot_secret=$$SECR3T_VAL use_bio_layer=0 || { echo "ERROR: failed to load snapshot"; exit 1; }
+		the_snapshot_secret=$$SECR3T_VAL use_bio_layer=1 || { echo "ERROR: failed to load snapshot"; exit 1; }
 
 load-fs:
 	sudo insmod $(SINGLEFILE_FS_DIR)/singlefilefs.ko

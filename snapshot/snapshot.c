@@ -831,6 +831,7 @@ static int __bread_gfp_handler(struct kretprobe_instance *ri, struct pt_regs *re
     //100 blocks with 4096 bytes = ~400KB not a big deal 
     void *copy = kmemdup(bh->b_data, bh->b_size, GFP_ATOMIC);
     if (!copy) {
+        xa_erase(&ses->pending_block, key);
         return 0;
     }
 
@@ -928,6 +929,7 @@ static struct kretprobe __bread_gfp_kp = {
     .maxactive = -1, 
 };
 
+
 /**
  * read_old_block - Read from bio the old block
  */
@@ -973,12 +975,6 @@ static int read_old_block(struct block_device *bdev, sector_t key, void *buf, un
 
 static sector_t get_physical_block(struct inode *inode, sector_t lblock)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,9,0)
-    if (inode->i_mapping && inode->i_mapping->a_ops && inode->i_mapping->a_ops->bmap)
-        /* bmap(mapping, lblock) : pblock (sector_t) */
-        return inode->i_mapping->a_ops->bmap(inode->i_mapping, lblock);
-#endif
-    {
         /*Since singlefilefs has [superblock][inode][file_data][..] we need to shif by 2*/
         struct super_block *sb = inode->i_sb;
         if (sb && sb->s_type && sb->s_type->name &&
@@ -991,7 +987,6 @@ static sector_t get_physical_block(struct inode *inode, sector_t lblock)
                 return pblock;
             return 0;
         }     
-    }
 }
 
 static int cow_schedule(struct file *file,
