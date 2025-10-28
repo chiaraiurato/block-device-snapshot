@@ -489,12 +489,12 @@ static void cow_mem_worker(struct work_struct *w)
             (unsigned long long)rec.offset,
             atomic64_read(&session->blocks_count));
 
-    mutex_unlock(&session->dir_mtx);
-
     /* Mark as saved */
     xa_store(&session->saved_blocks, mw->sector_key, xa_mk_value(1), GFP_KERNEL);
     /* Remove as pending */
     xa_erase(&session->pending_block, mw->sector_key);
+    
+    mutex_unlock(&session->dir_mtx);
 
 out:
     put_session(session); //release the ref count after work is done
